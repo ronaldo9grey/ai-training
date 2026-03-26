@@ -1,0 +1,24 @@
+INFO:celeryconfig:Celery 配置加载完成
+INFO:celeryconfig:Broker: redis://localhost:6379/0
+INFO:celeryconfig:Backend: redis://localhost:6379/1
+INFO:celeryconfig:Worker并发: 2
+WARNING:automl_engine:Optuna未安装，使用简化版网格搜索。运行: pip install optuna
+INFO:db_postgres:PostgreSQL连接池初始化成功: localhost:5432
+INFO:db_postgres:PostgreSQL表结构初始化完成
+INFO:db_postgres:PostgreSQL连接成功: PostgreSQL 18.2 on x86_64-pc-linux-gnu, compiled by gcc (Tencent Compiler 12.3.1.7) 12.3.1 20230912 (OpenCloudOS 12.3.1.7-1), 64-bit
+INFO:main:PostgreSQL数据库连接正常
+INFO:inference_service:推理服务初始化，设备: cpu
+INFO:inference_service:内存管理: 阈值80%, 最多5个模型, 空闲1800秒卸载
+INFO:     Started server process [745697]
+INFO:     Waiting for application startup.
+INFO:apscheduler.scheduler:Scheduler started
+INFO:main:定时任务调度器已启动
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8004 (Press CTRL+C to quit)
+WARNING:inference_service:内存使用过高 (80.8%)，触发清理
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:apscheduler.scheduler:Scheduler has been shut down
+INFO:main:定时任务调度器已关闭
+INFO:     Application shutdown complete.
+INFO:     Finished server process [745697]

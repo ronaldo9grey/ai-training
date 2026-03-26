@@ -1,0 +1,12 @@
+[2026-03-25T14:42:33.650975] ML训练开始: None - None
+
+[ERROR] 不支持的文件格式: 
+[2026-03-25T14:43:33.656655] ML训练开始: None - None
+
+[ERROR] 不支持的文件格式: 
+[2026-03-25T14:44:33.661450] ML训练开始: None - None
+
+[ERROR] Cannot perform reduction 'mean' with string dtype
+[2026-03-25T14:45:33.668855] ML训练开始: None - None
+
+[ERROR] Cannot perform reduction 'mean' with string dtype

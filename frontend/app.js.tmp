@@ -1,0 +1,713 @@
+// ============================================
+// 新版训练模块 - 整合单任务训练和超参优化
+// ============================================
+
+function TrainTab({ projectId, projectType, datasets, jobs, onRefresh }) {
+  // 子Tab切换: 'single' | 'automl'
+  const [activeSubTab, setActiveSubTab] = useState('single');
+  
+  // 单任务训练状态
+  const [selectedDataset, setSelectedDataset] = useState('');
+  const [selectedTemplate, setSelectedTemplate] = useState('balanced');
+  const [config, setConfig] = useState({});
+  const [starting, setStarting] = useState(false);
+  const [showHelp, setShowHelp] = useState(true);
+  const [columns, setColumns] = useState([]);
+  
+  // AutoML状态
+  const [automlExperiments, setAutomlExperiments] = useState([]);
+  const [showCreateAutoml, setShowCreateAutoml] = useState(false);
+  const [automlForm, setAutomlForm] = useState({name: '', dataset_id: '', max_trials: 10});
+  const [selectedAutomlExp, setSelectedAutomlExp] = useState(null);
+  const [automlTrials, setAutomlTrials] = useState([]);
+  const [loadingTrials, setLoadingTrials] = useState(false);
+  const [runningAutoml, setRunningAutoml] = useState(false);
+  
+  // 判断任务类型
+  const isNLP = projectType === 'text_classification';
+  const isTimeSeries = projectType === 'time_series';
+  const isImage = projectType === 'image_classification';
+  const isDetection = projectType === 'object_detection';
+
+  // 初始化配置
+  useEffect(() => {
+    if (isNLP) {
+      setConfig(TRAINING_TEMPLATES.balanced.config);
+    } else if (isTimeSeries) {
+      setConfig({
+        task_type: 'time_series',
+        model_type: 'random_forest',
+        target_column: '',
+        feature_columns: [],
+        time_column: 'timestamp',
+        n_estimators: 100,
+        forecast_horizon: 24
+      });
+    } else if (isImage) {
+      setConfig({
+        model_name: 'resnet50',
+        epochs: 10,
+        batch_size: 16,
+        learning_rate: 1e-4,
+        image_size: 224,
+        freeze_backbone: true,
+        val_split: 0.2,
+        quantize: false
+      });
+    } else if (isDetection) {
+      setConfig({
+        model: 'yolov8s',
+        epochs: 100,
+        batch_size: 16,
+        image_size: 640,
+        confidence_threshold: 0.25,
+        iou_threshold: 0.45
+      });
+    } else {
+      setConfig({
+        task_type: projectType,
+        model_type: 'random_forest',
+        target_column: '',
+        feature_columns: [],
+        n_estimators: 100,
+        contamination: 0.1
+      });
+    }
+  }, [projectType, isNLP, isTimeSeries, isImage, isDetection]);
+
+  // 加载数据集列信息
+  const loadDatasetColumns = async (datasetId) => {
+    if (!datasetId) return;
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/datasets/${datasetId}/preview?limit=5`);
+      const data = await res.json();
+      setColumns(data.columns || []);
+      
+      if (data.columns && data.columns.length > 0 && !isNLP) {
+        const lastCol = data.columns[data.columns.length - 1];
+        const featureCols = data.columns.slice(0, -1);
+        setConfig(prev => ({
+          ...prev,
+          target_column: lastCol,
+          feature_columns: featureCols
+        }));
+      }
+    } catch (e) {}
+  };
+
+  // 应用模板
+  const applyTemplate = (templateKey) => {
+    setSelectedTemplate(templateKey);
+    if (isNLP && TRAINING_TEMPLATES[templateKey]) {
+      setConfig(TRAINING_TEMPLATES[templateKey].config);
+    } else if (isTimeSeries && ML_TEMPLATES.time_series?.[templateKey]) {
+      setConfig({ ...config, ...ML_TEMPLATES.time_series[templateKey] });
+    } else if (isImage && ML_TEMPLATES.image_classification?.[templateKey]) {
+      setConfig({ ...config, ...ML_TEMPLATES.image_classification[templateKey] });
+    } else if (isDetection && ML_TEMPLATES.object_detection?.[templateKey]) {
+      setConfig({ ...config, ...ML_TEMPLATES.object_detection[templateKey] });
+    } else if (!isNLP && !isTimeSeries && !isImage && !isDetection && ML_TEMPLATES[projectType]?.[templateKey]) {
+      setConfig({ ...config, ...ML_TEMPLATES[projectType][templateKey] });
+    }
+  };
+
+  // 启动单任务训练
+  const startTraining = async () => {
+    if (!selectedDataset) {
+      alert('请先选择数据集');
+      return;
+    }
+    if (!isNLP && (!config.target_column || config.feature_columns.length === 0)) {
+      alert('请配置目标列和特征列');
+      return;
+    }
+    
+    setStarting(true);
+    try {
+      const formData = new FormData();
+      formData.append('dataset_id', selectedDataset);
+      formData.append('config', JSON.stringify(config));
+      formData.append('template', selectedTemplate);
+      
+      const res = await fetch(`${API_BASE}/projects/${projectId}/train`, {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (res.ok) {
+        alert('训练任务已启动！');
+        onRefresh();
+      } else {
+        const data = await res.json();
+        alert('启动失败: ' + (data.detail || '未知错误'));
+      }
+    } catch (e) {
+      alert('启动失败: ' + e.message);
+    }
+    setStarting(false);
+  };
+
+  // ============ AutoML 功能 ============
+  
+  // 加载AutoML实验列表
+  const loadAutomlExperiments = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/automl/experiments`);
+      const data = await res.json();
+      setAutomlExperiments(data.experiments || []);
+    } catch (e) {
+      console.error('加载AutoML实验失败:', e);
+    }
+  };
+
+  // 加载单个实验的trials
+  const loadAutomlTrials = async (expId) => {
+    setLoadingTrials(true);
+    try {
+      const res = await fetch(`${API_BASE}/automl/experiments/${expId}`);
+      const data = await res.json();
+      if (data.experiment) {
+        setSelectedAutomlExp(data.experiment);
+        setAutomlTrials(data.trials || []);
+      }
+    } catch (e) {
+      console.error('加载trials失败:', e);
+    }
+    setLoadingTrials(false);
+  };
+
+  // 创建AutoML实验 - 一次性生成全部参数
+  const createAutomlExperiment = async () => {
+    if (!automlForm.name || !automlForm.dataset_id) {
+      alert('请填写实验名称和选择数据集');
+      return;
+    }
+    
+    try {
+      const form = new FormData();
+      form.append('dataset_id', automlForm.dataset_id);
+      form.append('name', automlForm.name);
+      form.append('max_trials', automlForm.max_trials);
+      
+      const res = await fetch(`${API_BASE}/projects/${projectId}/automl/experiments`, {
+        method: 'POST',
+        body: form
+      });
+      
+      const data = await res.json();
+      if (!res.ok) {
+        alert('创建实验失败: ' + (data.detail || data.error || `请求失败 (${res.status})`));
+        return;
+      }
+      
+      // 创建成功后，立即生成全部参数组
+      const expId = data.experiment_id;
+      await generateAllTrials(expId, parseInt(automlForm.max_trials));
+      
+      setShowCreateAutoml(false);
+      setAutomlForm({name: '', dataset_id: '', max_trials: 10});
+      await loadAutomlExperiments();
+      
+      // 自动选中并加载新创建的实验
+      await loadAutomlTrials(expId);
+      
+    } catch (e) {
+      alert('创建实验失败: ' + e.message);
+    }
+  };
+
+  // 生成全部参数组
+  const generateAllTrials = async (expId, maxTrials) => {
+    for (let i = 1; i <= maxTrials; i++) {
+      try {
+        await fetch(`${API_BASE}/automl/experiments/${expId}/run`, {
+          method: 'POST'
+        });
+      } catch (e) {
+        console.error(`生成第${i}组参数失败:`, e);
+      }
+    }
+  };
+
+  // 一键启动全部AutoML训练
+  const runAllAutomlTrials = async () => {
+    if (!selectedAutomlExp) return;
+    
+    const pendingTrials = automlTrials.filter(t => t.status === 'pending');
+    if (pendingTrials.length === 0) {
+      alert('没有待运行的参数组');
+      return;
+    }
+    
+    setRunningAutoml(true);
+    alert(`开始批量训练，共${pendingTrials.length}组参数`);
+    
+    // 顺序执行每个trial
+    for (const trial of pendingTrials) {
+      try {
+        await runSingleTrial(trial);
+        // 刷新状态
+        await loadAutomlTrials(selectedAutomlExp.id);
+      } catch (e) {
+        console.error(`运行trial ${trial.trial_number}失败:`, e);
+      }
+    }
+    
+    setRunningAutoml(false);
+    alert('批量训练完成！');
+    onRefresh(); // 刷新任务列表
+  };
+
+  // 运行单个trial
+  const runSingleTrial = async (trial) => {
+    // 1. 启动训练任务
+    const formData = new FormData();
+    formData.append('dataset_id', selectedAutomlExp.dataset_id);
+    formData.append('config', JSON.stringify(trial.params));
+    formData.append('template', 'custom');
+    formData.append('automl_trial_id', trial.id);
+    
+    const res = await fetch(`${API_BASE}/projects/${projectId}/train`, {
+      method: 'POST',
+      body: formData
+    });
+    
+    if (!res.ok) {
+      throw new Error('启动训练失败');
+    }
+    
+    const data = await res.json();
+    const jobId = data.job_id;
+    
+    // 2. 更新trial状态为running
+    await fetch(`${API_BASE}/automl/trials/${trial.id}/status`, {
+      method: 'POST',
+      body: new FormData().append('status', 'running').append('job_id', jobId)
+    });
+    
+    // 3. 轮询等待训练完成
+    await waitForJobComplete(jobId, trial.id);
+  };
+
+  // 等待任务完成
+  const waitForJobComplete = async (jobId, trialId) => {
+    const maxAttempts = 60; // 最多等待30分钟
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(r => setTimeout(r, 30000)); // 30秒轮询一次
+      
+      const res = await fetch(`${API_BASE}/projects/${projectId}/jobs/${jobId}`);
+      const job = await res.json();
+      
+      if (job.status === 'completed') {
+        // 记录结果
+        await fetch(`${API_BASE}/automl/trials/${trialId}/record`, {
+          method: 'POST',
+          body: new FormData().append('metrics', JSON.stringify({
+            accuracy: job.best_accuracy || 0,
+            loss: job.best_loss || 0
+          })).append('job_id', jobId)
+        });
+        return;
+      } else if (job.status === 'failed') {
+        await fetch(`${API_BASE}/automl/trials/${trialId}/status`, {
+          method: 'POST',
+          body: new FormData().append('status', 'failed')
+        });
+        return;
+      }
+    }
+  };
+
+  // 应用最佳参数
+  const applyBestParams = async () => {
+    if (!selectedAutomlExp || !selectedAutomlExp.best_trial_id) {
+      alert('还没有完成的实验结果');
+      return;
+    }
+    
+    const bestTrial = automlTrials.find(t => t.id === selectedAutomlExp.best_trial_id);
+    if (!bestTrial) {
+      alert('未找到最佳参数');
+      return;
+    }
+    
+    // 切换到单任务训练，并填充最佳参数
+    setActiveSubTab('single');
+    setConfig(bestTrial.params);
+    setSelectedDataset(selectedAutomlExp.dataset_id);
+    await loadDatasetColumns(selectedAutomlExp.dataset_id);
+    
+    alert(`已应用最佳参数（准确率: ${(selectedAutomlExp.best_accuracy * 100).toFixed(2)}%），请确认后启动训练`);
+  };
+
+  // 导出实验报告
+  const exportReport = () => {
+    if (!selectedAutomlExp || automlTrials.length === 0) {
+      alert('没有可导出的数据');
+      return;
+    }
+    
+    const report = {
+      experiment: selectedAutomlExp,
+      trials: automlTrials,
+      summary: {
+        total_trials: automlTrials.length,
+        completed: automlTrials.filter(t => t.status === 'completed').length,
+        best_accuracy: selectedAutomlExp.best_accuracy,
+        best_params: automlTrials.find(t => t.id === selectedAutomlExp.best_trial_id)?.params
+      }
+    };
+    
+    const blob = new Blob([JSON.stringify(report, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `automl_report_${selectedAutomlExp.name}_${new Date().toISOString().split('T')[0]}.json`;
+    a.click();
+  };
+
+  // 初始加载
+  useEffect(() => {
+    loadAutomlExperiments();
+  }, [projectId]);
+
+  // ============ 渲染 ============
+  
+  return (
+    <div className="space-y-4">
+      {/* 子Tab切换 */}
+      <div className="flex gap-2 border-b border-gray-200">
+        <button
+          onClick={() => setActiveSubTab('single')}
+          className={`px-4 py-3 font-medium transition-colors ${
+            activeSubTab === 'single'
+              ? 'text-purple-600 border-b-2 border-purple-600'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          🚀 单任务训练
+        </button>
+        <button
+          onClick={() => setActiveSubTab('automl')}
+          className={`px-4 py-3 font-medium transition-colors ${
+            activeSubTab === 'automl'
+              ? 'text-purple-600 border-b-2 border-purple-600'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          ⚡ 超参优化 (AutoML)
+        </button>
+      </div>
+
+      {/* ========== 单任务训练 ========== */}
+      {activeSubTab === 'single' && (
+        <>
+          {/* 训练指南 */}
+          {showHelp && (
+            <div className="bg-gradient-to-r from-cyan-50 to-blue-50 rounded-2xl p-5 border border-cyan-200">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="font-semibold text-cyan-800 flex items-center gap-2">
+                  <Icons.Help /> 快速开始
+                </h4>
+                <button onClick={() => setShowHelp(false)} className="text-cyan-600 text-sm">隐藏</button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                <div className="p-3 bg-white rounded-lg">
+                  <div className="font-medium text-gray-800 mb-1">1️⃣ 选择数据集</div>
+                  <p className="text-gray-600">选择已上传并预处理好的数据集。</p>
+                </div>
+                <div className="p-3 bg-white rounded-lg">
+                  <div className="font-medium text-gray-800 mb-1">2️⃣ 选择配置模板</div>
+                  <p className="text-gray-600">快速训练、平衡配置、精确模式三选一。</p>
+                </div>
+                <div className="p-3 bg-white rounded-lg">
+                  <div className="font-medium text-gray-800 mb-1">3️⃣ 调整参数（可选）</div>
+                  <p className="text-gray-600">根据需求微调学习率、批次大小等参数。</p>
+                </div>
+                <div className="p-3 bg-white rounded-lg">
+                  <div className="font-medium text-gray-800 mb-1">4️⃣ 启动训练</div>
+                  <p className="text-gray-600">点击开始训练，系统将自动完成训练和评估。</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 数据集选择 */}
+          <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+            <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+              <Icons.Database /> 选择数据集
+            </h3>
+            <select
+              value={selectedDataset}
+              onChange={(e) => {
+                setSelectedDataset(e.target.value);
+                loadDatasetColumns(e.target.value);
+              }}
+              className="w-full px-4 py-3 rounded-xl border border-gray-200 bg-white focus:border-purple-400 focus:outline-none"
+            >
+              <option value="">请选择数据集</option>
+              {(datasets || []).map(ds => (
+                <option key={ds.id} value={ds.id}>{ds.name} ({ds.total_samples}条)</option>
+              ))}
+            </select>
+          </div>
+
+          {/* 配置模板 */}
+          <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+            <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+              <Icons.Settings /> 配置模板
+            </h3>
+            <div className="grid grid-cols-3 gap-3">
+              {Object.entries(TRAINING_TEMPLATES).map(([key, template]) => (
+                <button
+                  key={key}
+                  onClick={() => applyTemplate(key)}
+                  className={`p-4 rounded-xl border-2 text-left transition-all ${
+                    selectedTemplate === key
+                      ? 'border-purple-500 bg-purple-50'
+                      : 'border-gray-200 hover:border-purple-300'
+                  }`}
+                >
+                  <div className="font-medium text-gray-800 mb-1">{template.name}</div>
+                  <div className="text-xs text-gray-500">{template.desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 启动按钮 */}
+          <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+            <button
+              onClick={startTraining}
+              disabled={starting || !selectedDataset}
+              className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-xl font-bold text-lg hover:shadow-lg disabled:opacity-50 transition-all"
+            >
+              {starting ? <Icons.Loading /> : '🚀 开始训练'}
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* ========== 超参优化 (AutoML) ========== */}
+      {activeSubTab === 'automl' && (
+        <>
+          {/* 实验列表 */}
+          <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-semibold text-gray-800 flex items-center gap-2">
+                <Icons.Sparkles /> 超参优化实验
+              </h3>
+              <button
+                onClick={() => setShowCreateAutoml(true)}
+                className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700"
+              >
+                + 创建实验
+              </button>
+            </div>
+
+            {automlExperiments.length === 0 ? (
+              <div className="text-center py-8 text-gray-500">
+                <Icons.Sparkles className="w-12 h-12 mx-auto mb-4 text-purple-300" />
+                <p>暂无超参优化实验</p>
+                <p className="text-sm mt-2">创建实验，自动搜索最优超参数组合</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {automlExperiments.map(exp => (
+                  <div
+                    key={exp.id}
+                    onClick={() => loadAutomlTrials(exp.id)}
+                    className={`p-4 rounded-xl border cursor-pointer transition-all ${
+                      selectedAutomlExp?.id === exp.id
+                        ? 'border-purple-500 bg-purple-50'
+                        : 'border-gray-200 hover:border-purple-300'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="font-medium text-gray-800">{exp.name}</div>
+                        <div className="text-sm text-gray-500">
+                          {exp.trials_count || 0}/{exp.max_trials} 组参数
+                          {exp.best_accuracy > 0 && ` · 最佳准确率: ${(exp.best_accuracy * 100).toFixed(2)}%`}
+                        </div>
+                      </div>
+                      <span className={`px-2 py-1 rounded text-xs ${
+                        exp.status === 'completed' ? 'bg-green-100 text-green-700' :
+                        exp.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                        'bg-gray-100 text-gray-700'
+                      }`}>
+                        {exp.status === 'completed' ? '已完成' :
+                         exp.status === 'running' ? '进行中' : '待开始'}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 创建实验弹窗 */}
+          {showCreateAutoml && (
+            <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+              <h4 className="font-semibold text-gray-800 mb-4">创建超参优化实验</h4>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">实验名称</label>
+                  <input
+                    type="text"
+                    value={automlForm.name}
+                    onChange={(e) => setAutomlForm({...automlForm, name: e.target.value})}
+                    placeholder="如：BERT学习率搜索"
+                    className="w-full px-3 py-2 rounded-lg border border-gray-200 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">选择数据集</label>
+                  <select
+                    value={automlForm.dataset_id}
+                    onChange={(e) => setAutomlForm({...automlForm, dataset_id: e.target.value})}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-200 bg-white"
+                  >
+                    <option value="">请选择</option>
+                    {(datasets || []).map(ds => (
+                      <option key={ds.id} value={ds.id}>{ds.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">搜索组数</label>
+                  <select
+                    value={automlForm.max_trials}
+                    onChange={(e) => setAutomlForm({...automlForm, max_trials: e.target.value})}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-200 bg-white"
+                  >
+                    <option value="5">5组（快速）</option>
+                    <option value="10">10组（推荐）</option>
+                    <option value="20">20组（深度）</option>
+                  </select>
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    onClick={createAutomlExperiment}
+                    className="flex-1 py-2 bg-purple-600 text-white rounded-lg font-medium"
+                  >
+                    创建并生成参数
+                  </button>
+                  <button
+                    onClick={() => setShowCreateAutoml(false)}
+                    className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 参数组列表 */}
+          {selectedAutomlExp && (
+            <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-semibold text-gray-800">
+                  {selectedAutomlExp.name} - 参数组
+                </h3>
+                <div className="flex gap-2">
+                  <button
+                    onClick={runAllAutomlTrials}
+                    disabled={runningAutoml}
+                    className="px-4 py-2 bg-gradient-to-r from-orange-500 to-red-500 text-white rounded-lg font-medium disabled:opacity-50"
+                  >
+                    {runningAutoml ? <Icons.Loading /> : '▶️ 一键启动全部'}
+                  </button>
+                  {selectedAutomlExp.best_accuracy > 0 && (
+                    <button
+                      onClick={applyBestParams}
+                      className="px-4 py-2 bg-green-600 text-white rounded-lg font-medium"
+                    >
+                      ✅ 应用最佳参数
+                    </button>
+                  )}
+                  <button
+                    onClick={exportReport}
+                    className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg"
+                  >
+                    📥 导出报告
+                  </button>
+                </div>
+              </div>
+
+              {loadingTrials ? (
+                <div className="text-center py-8">
+                  <Icons.Loading />
+                  <p className="text-gray-500 mt-2">加载中...</p>
+                </div>
+              ) : automlTrials.length === 0 ? (
+                <div className="text-center py-8 text-gray-500">
+                  <p>正在生成参数组...</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-200">
+                        <th className="text-left py-3 px-2">#</th>
+                        <th className="text-left py-3 px-2">超参数</th>
+                        <th className="text-left py-3 px-2">状态</th>
+                        <th className="text-left py-3 px-2">准确率</th>
+                        <th className="text-left py-3 px-2">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {automlTrials.map((trial) => (
+                        <tr key={trial.id} className={`border-b border-gray-100 ${
+                          trial.id === selectedAutomlExp.best_trial_id ? 'bg-green-50' : ''
+                        }`}>
+                          <td className="py-3 px-2">
+                            {trial.id === selectedAutomlExp.best_trial_id ? '⭐' : trial.trial_number}
+                          </td>
+                          <td className="py-3 px-2">
+                            <div className="text-xs text-gray-600 max-w-xs truncate">
+                              {Object.entries(trial.params || {}).map(([k, v]) => `${k}=${v}`).join(', ')}
+                            </div>
+                          </td>
+                          <td className="py-3 px-2">
+                            <span className={`px-2 py-0.5 rounded text-xs ${
+                              trial.status === 'completed' ? 'bg-green-100 text-green-700' :
+                              trial.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                              trial.status === 'failed' ? 'bg-red-100 text-red-700' :
+                              'bg-gray-100 text-gray-700'
+                            }`}>
+                              {trial.status === 'completed' ? '完成' :
+                               trial.status === 'running' ? '运行中' :
+                               trial.status === 'failed' ? '失败' : '待运行'}
+                            </span>
+                          </td>
+                          <td className="py-3 px-2">
+                            {trial.metrics?.accuracy ? 
+                              `${(trial.metrics.accuracy * 100).toFixed(2)}%` : 
+                              '-'
+                            }
+                          </td>
+                          <td className="py-3 px-2">
+                            {trial.status === 'pending' && (
+                              <button
+                                onClick={() => runSingleTrial(trial)}
+                                className="text-xs px-2 py-1 bg-purple-100 text-purple-700 rounded"
+                              >
+                                运行
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

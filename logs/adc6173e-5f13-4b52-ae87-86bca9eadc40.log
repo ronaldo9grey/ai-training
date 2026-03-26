@@ -1,0 +1,5 @@
+[2026-03-25T15:03:09.673562] ML训练开始: None - None
+
+[ERROR] Cannot perform reduction 'mean' with string dtype
+[2026-03-25T15:04:09.681349] ML训练开始: None - None
+[2026-03-25T15:04:10.053550] ML训练完成

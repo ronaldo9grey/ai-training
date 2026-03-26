@@ -1,0 +1,4 @@
+normal
+scratch
+inclusion
+patch

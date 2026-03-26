@@ -1,0 +1,3351 @@
+# AI模型训练工坊 —— 从数据到部署的完整MLOps平台
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Response, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import os
+import json
+import uuid
+from datetime import datetime
+import asyncio
+from pathlib import Path
+import logging
+import io
+import base64
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# PostgreSQL数据库
+from db_postgres import (
+    init_connection_pool, init_database_tables,
+    get_db_connection, execute_query, execute_update,
+    test_connection as test_db_connection
+)
+
+# Prometheus监控
+from metrics_collector import metrics, get_metrics_response, CONTENT_TYPE_LATEST
+
+# Celery 任务队列
+from celeryconfig import celery_app
+from tasks import (
+    submit_training_task, submit_ml_training_task, submit_image_training_task, submit_object_detection_task,
+    run_training_task, run_ml_training_task, run_image_training_task, run_object_detection_task
+)
+
+# 模型导出
+from image_trainer import quantize_model
+from alert_engine import AlertEngine, get_project_alert_rules, get_alert_history
+from automl_engine import (
+    AutoMLExperiment, AutoMLConfig, create_automl_experiment,
+    run_automl_trial, compare_trials, get_recommended_params
+)
+
+app = FastAPI(title="AI模型训练工坊", description="从数据到部署的完整MLOps平台", version="2.2.0")
+
+# 初始化PostgreSQL
+init_connection_pool()
+init_database_tables()
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 配置
+DATA_DIR = Path("/var/www/ai-training/data")
+MODELS_DIR = Path("/var/www/ai-training/models")
+LOGS_DIR = Path("/var/www/ai-training/logs")
+
+
+
+# 初始化数据库
+def init_db():
+    """初始化数据库，检查连接状态"""
+    if not test_db_connection():
+        raise Exception("PostgreSQL连接失败，请检查配置")
+    logger.info("PostgreSQL数据库连接正常")
+
+init_db()
+
+# ============ 数据模型 ============
+
+class ProjectCreate(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    task_type: str = "text_classification"
+
+class TrainingConfig(BaseModel):
+    model_name: str = "bert-base-chinese"
+    learning_rate: float = 2e-5
+    batch_size: int = 16
+    epochs: int = 3
+    max_length: int = 512
+    train_ratio: float = 0.7
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+    gpu_type: str = "local"  # local 或 cloud
+    cloud_provider: Optional[str] = None
+
+class AnnotationTask(BaseModel):
+    content: str
+    label: Optional[str] = None
+
+# ============ API端点 ============
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "service": "AI模型训练工坊", "version": "2.2.0"}
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus监控指标端点"""
+    from metrics_collector import get_metrics_response, CONTENT_TYPE_LATEST
+    return Response(
+        content=get_metrics_response(),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
+# 项目管理
+@app.post("/api/projects")
+async def create_project(project: ProjectCreate):
+    project_id = str(uuid.uuid4())
+    
+    execute_update('''
+        INSERT INTO projects (id, name, description, task_type, config)
+        VALUES (%s, %s, %s, %s, %s)
+    ''', (project_id, project.name, project.description, project.task_type, json.dumps({})))
+    
+    # 创建项目目录
+    (DATA_DIR / project_id).mkdir(parents=True, exist_ok=True)
+    (MODELS_DIR / project_id).mkdir(parents=True, exist_ok=True)
+    
+    return {"success": True, "project_id": project_id}
+
+@app.get("/api/projects")
+async def list_projects():
+    try:
+        # 使用PostgreSQL查询
+        from db_postgres import execute_query
+        
+        rows = execute_query('''
+            SELECT id, name, description, task_type, status, created_at 
+            FROM projects ORDER BY created_at DESC
+        ''')
+        
+        projects = []
+        for row in rows:
+            # 根据训练任务状态动态计算项目状态
+            job_rows = execute_query('''
+                SELECT status FROM training_jobs 
+                WHERE project_id = %s ORDER BY created_at DESC LIMIT 1
+            ''', (row['id'],))
+            
+            display_status = row['status']
+            if job_rows:
+                job_status = job_rows[0]['status']
+                if job_status == 'training':
+                    display_status = 'training'
+                elif job_status == 'completed':
+                    display_status = 'completed'
+                elif job_status == 'failed':
+                    # 如果有失败的任务，检查是否有成功的
+                    completed_jobs = execute_query('''
+                        SELECT COUNT(*) as cnt FROM training_jobs 
+                        WHERE project_id = %s AND status = 'completed'
+                    ''', (row['id'],))
+                    if completed_jobs and completed_jobs[0]['cnt'] > 0:
+                        display_status = 'completed'
+                    else:
+                        display_status = 'created'  # 失败但还没成功的，显示未开始
+            
+            projects.append({
+                "id": row['id'],
+                "name": row['name'],
+                "description": row['description'],
+                "task_type": row['task_type'],
+                "status": display_status,
+                "created_at": row['created_at']
+            })
+        
+        return {"projects": projects}
+    except Exception as e:
+        logger.error(f"查询项目列表失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str):
+    rows = execute_query('SELECT * FROM projects WHERE id = %s', (project_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    row = rows[0]
+    return {
+        "id": row['id'],
+        "name": row['name'],
+        "description": row['description'],
+        "task_type": row['task_type'],
+        "status": row['status'],
+        "created_at": row['created_at'],
+        "updated_at": row['updated_at'],
+        "config": row['config'] if row['config'] else {}
+    }
+
+# 数据集管理
+@app.post("/api/projects/{project_id}/datasets")
+async def upload_dataset(
+    project_id: str,
+    file: UploadFile = File(...),
+    name: str = Form(...)
+):
+    # 验证项目存在
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    # 保存文件
+    dataset_id = str(uuid.uuid4())
+    file_ext = file.filename.split('.')[-1]
+    file_path = DATA_DIR / project_id / f"{dataset_id}.{file_ext}"
+    
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    # 解析数据集
+    try:
+        if file_ext in ['csv', 'txt']:
+            import pandas as pd
+            df = pd.read_csv(file_path)
+            total_samples = len(df)
+            # 假设最后一列是标签
+            labels = df.iloc[:, -1].unique().tolist() if len(df.columns) > 1 else []
+        else:
+            total_samples = 0
+            labels = []
+    except Exception as e:
+        total_samples = 0
+        labels = []
+    
+    execute_update('''
+        INSERT INTO datasets (id, project_id, name, file_path, file_type, total_samples, labels, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (dataset_id, project_id, name, str(file_path), file_ext, total_samples, json.dumps(labels), 'uploaded'))
+    
+    return {
+        "success": True,
+        "dataset_id": dataset_id,
+        "total_samples": total_samples,
+        "labels": labels
+    }
+
+@app.get("/api/projects/{project_id}/datasets")
+async def list_datasets(project_id: str):
+    rows = execute_query('''
+        SELECT id, name, file_type, total_samples, labels, status, created_at
+        FROM datasets WHERE project_id = %s ORDER BY created_at DESC
+    ''', (project_id,))
+    
+    datasets = []
+    for row in rows:
+        datasets.append({
+            "id": row['id'],
+            "name": row['name'],
+            "file_type": row['file_type'],
+            "total_samples": row['total_samples'],
+            "labels": row['labels'] if row['labels'] else [],
+            "status": row['status'],
+            "created_at": row['created_at']
+        })
+    
+    return {"datasets": datasets}
+
+# 数据预览（限制条数）
+@app.get("/api/projects/{project_id}/datasets/{dataset_id}/preview")
+async def preview_dataset(project_id: str, dataset_id: str, limit: int = 100):
+    """预览数据集内容，默认最多返回100条"""
+    rows = execute_query('''
+        SELECT file_path, file_type FROM datasets WHERE id = %s AND project_id = %s
+    ''', (dataset_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    file_path = rows[0]['file_path']
+    file_type = rows[0]['file_type']
+    
+    try:
+        import os
+        import pandas as pd
+        
+        # 检查是否是目录
+        if os.path.isdir(file_path):
+            # 首先尝试查找图片文件
+            image_files = []
+            csv_files = []
+            
+            for root, dirs, files in os.walk(file_path):
+                for f in files:
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
+                        rel_path = os.path.relpath(os.path.join(root, f), file_path)
+                        image_files.append(rel_path)
+                    elif f.lower().endswith('.csv'):
+                        csv_files.append(os.path.join(root, f))
+            
+            # 如果是图片数据集
+            if image_files and not csv_files:
+                return {
+                    "columns": ["图片路径", "类别文件夹"],
+                    "preview": [{"图片路径": f, "类别文件夹": f.split('/')[0] if '/' in f else '根目录'} for f in image_files[:limit]],
+                    "total_rows": len(image_files),
+                    "preview_rows": min(len(image_files), limit),
+                    "limit": limit,
+                    "type": "image_folder"
+                }
+            
+            # 如果是CSV数据集（目录下有CSV文件）
+            if csv_files:
+                # 使用第一个CSV文件
+                csv_path = csv_files[0]
+                df = pd.read_csv(csv_path)
+                total_rows = len(df)
+                preview_df = df.head(min(limit, 100))
+                
+                return {
+                    "columns": df.columns.tolist(),
+                    "preview": preview_df.to_dict(orient='records'),
+                    "total_rows": total_rows,
+                    "preview_rows": len(preview_df),
+                    "limit": limit,
+                    "type": "csv"
+                }
+            
+            # 空目录
+            return {
+                "columns": [],
+                "preview": [],
+                "total_rows": 0,
+                "preview_rows": 0,
+                "limit": limit,
+                "type": "empty"
+            }
+        else:
+            # CSV/文本数据集（具体文件路径）
+            df = pd.read_csv(file_path)
+            total_rows = len(df)
+            
+            # 限制预览条数
+            preview_df = df.head(min(limit, 100))
+            
+            return {
+                "columns": df.columns.tolist(),
+                "preview": preview_df.to_dict(orient='records'),
+                "total_rows": total_rows,
+                "preview_rows": len(preview_df),
+                "limit": limit,
+                "type": "csv"
+            }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"数据解析失败: {str(e)}")
+
+
+# 图片数据集查看单张图片
+@app.get("/api/projects/{project_id}/datasets/{dataset_id}/image")
+async def get_dataset_image(project_id: str, dataset_id: str, path: str = Query(..., description="图片相对路径")):
+    """获取图片数据集中的单张图片"""
+    rows = execute_query('''
+        SELECT file_path, file_type FROM datasets WHERE id = %s AND project_id = %s
+    ''', (dataset_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    file_path = rows[0]['file_path']
+    
+    import os
+    from fastapi.responses import FileResponse
+    
+    # 安全检查：确保路径在数据集目录内
+    full_path = os.path.normpath(os.path.join(file_path, path))
+    if not full_path.startswith(os.path.normpath(file_path)):
+        raise HTTPException(status_code=403, detail="非法路径")
+    
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="图片不存在")
+    
+    # 根据文件扩展名返回正确的 content-type
+    ext = os.path.splitext(full_path)[1].lower()
+    media_type = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.bmp': 'image/bmp',
+        '.webp': 'image/webp'
+    }.get(ext, 'application/octet-stream')
+    
+    return FileResponse(full_path, media_type=media_type)
+
+
+# 数据集下载
+@app.get("/api/projects/{project_id}/datasets/{dataset_id}/download")
+async def download_dataset(project_id: str, dataset_id: str):
+    """下载数据集文件"""
+    from fastapi.responses import FileResponse
+    
+    rows = execute_query('''
+        SELECT file_path, name, file_type FROM datasets WHERE id = %s AND project_id = %s
+    ''', (dataset_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    file_path = rows[0]['file_path']
+    name = rows[0]['name']
+    file_type = rows[0]['file_type']
+    
+    if not Path(file_path).exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    
+    filename = f"{name}.{file_type}"
+    
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type='text/csv'
+    )
+    
+
+
+# 数据预处理与划分
+@app.post("/api/projects/{project_id}/datasets/{dataset_id}/preprocess")
+async def preprocess_dataset(
+    project_id: str,
+    dataset_id: str,
+    config: TrainingConfig
+):
+    rows = execute_query('''
+        SELECT file_path FROM datasets WHERE id = %s AND project_id = %s
+    ''', (dataset_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    file_path = rows[0]['file_path']
+    
+    # 数据预处理逻辑
+    try:
+        import pandas as pd
+        from sklearn.model_selection import train_test_split
+        
+        df = pd.read_csv(file_path)
+        total = len(df)
+        
+        # 划分数据集
+        train_df, temp_df = train_test_split(
+            df, 
+            test_size=(1 - config.train_ratio),
+            random_state=42,
+            stratify=df.iloc[:, -1] if len(df.columns) > 1 else None
+        )
+        
+        val_ratio_adjusted = config.val_ratio / (config.val_ratio + config.test_ratio)
+        val_df, test_df = train_test_split(
+            temp_df,
+            test_size=(1 - val_ratio_adjusted),
+            random_state=42,
+            stratify=temp_df.iloc[:, -1] if len(temp_df.columns) > 1 else None
+        )
+        
+        # 保存划分后的数据
+        project_data_dir = DATA_DIR / project_id
+        train_df.to_csv(project_data_dir / f"{dataset_id}_train.csv", index=False)
+        val_df.to_csv(project_data_dir / f"{dataset_id}_val.csv", index=False)
+        test_df.to_csv(project_data_dir / f"{dataset_id}_test.csv", index=False)
+        
+        # 更新数据库
+        execute_update('''
+            UPDATE datasets 
+            SET train_samples = %s, val_samples = %s, test_samples = %s, status = 'preprocessed'
+            WHERE id = %s
+        ''', (len(train_df), len(val_df), len(test_df), dataset_id))
+        
+        return {
+            "success": True,
+            "train_samples": len(train_df),
+            "val_samples": len(val_df),
+            "test_samples": len(test_df)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"预处理失败: {str(e)}")
+
+# 标注管理
+@app.post("/api/projects/{project_id}/annotations")
+async def create_annotation_task(project_id: str, task: AnnotationTask):
+    annotation_id = str(uuid.uuid4())
+    
+    execute_update('''
+        INSERT INTO annotations (id, project_id, data_id, content, label, status)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    ''', (annotation_id, project_id, annotation_id, task.content, task.label, 'pending'))
+    
+    return {"success": True, "annotation_id": annotation_id}
+
+@app.get("/api/projects/{project_id}/annotations")
+async def list_annotations(project_id: str, status: Optional[str] = None):
+    if status:
+        rows = execute_query('''
+            SELECT id, content, label, status, annotated_at 
+            FROM annotations WHERE project_id = %s AND status = %s
+        ''', (project_id, status))
+    else:
+        rows = execute_query('''
+            SELECT id, content, label, status, annotated_at 
+            FROM annotations WHERE project_id = %s
+        ''', (project_id,))
+    
+    annotations = []
+    for row in rows:
+        annotations.append({
+            "id": row['id'],
+            "content": row['content'],
+            "label": row['label'],
+            "status": row['status'],
+            "annotated_at": row['annotated_at']
+        })
+    
+    return {"annotations": annotations}
+
+@app.put("/api/projects/{project_id}/annotations/{annotation_id}")
+async def update_annotation(project_id: str, annotation_id: str, label: str):
+    execute_update('''
+        UPDATE annotations 
+        SET label = %s, status = 'completed', annotated_at = CURRENT_TIMESTAMP
+        WHERE id = %s AND project_id = %s
+    ''', (label, annotation_id, project_id))
+    
+    return {"success": True}
+
+# 训练任务管理
+@app.post("/api/projects/{project_id}/train")
+async def start_training_v2(
+    project_id: str,
+    dataset_id: str = Form(...),
+    config: str = Form(...),
+    template: Optional[str] = Form(None),
+    automl_trial_id: Optional[str] = Form(None)
+):
+    """启动训练任务 - 增强版（支持多种任务类型）"""
+    
+    config_dict = json.loads(config)
+    
+    # 如果指定了模板，合并配置
+    if template and template in TRAINING_TEMPLATES:
+        template_config = TRAINING_TEMPLATES[template]["config"].copy()
+        template_config.update(config_dict)  # 用户配置覆盖模板
+        config_dict = template_config
+    
+    # 获取项目信息（判断任务类型）
+    rows = execute_query('SELECT task_type FROM projects WHERE id = %s', (project_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    project_task_type = rows[0]['task_type'] or 'text_classification'
+    
+    job_id = str(uuid.uuid4())
+    log_path = LOGS_DIR / f"{job_id}.log"
+    model_path = MODELS_DIR / project_id / f"{job_id}"
+    
+    # 确定模型名称显示（加时间戳区分同名任务）
+    from datetime import datetime
+    base_name = config_dict.get("model_name", config_dict.get("model_type", "unknown"))
+    timestamp = datetime.now().strftime("%m%d-%H:%M")
+    model_display = f"{base_name} ({timestamp})"
+    
+    # 如果来自AutoML，在模型名称中标记
+    if automl_trial_id:
+        model_display = f"[AutoML] {model_display}"
+    
+    execute_update('''
+        INSERT INTO training_jobs (
+            id, project_id, dataset_id, model_name, total_epochs, 
+            log_path, model_path, config, status, automl_trial_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (
+        job_id, project_id, dataset_id, model_display,
+        config_dict.get("epochs", config_dict.get("n_estimators", 100)), 
+        str(log_path), str(model_path),
+        json.dumps(config_dict), 'pending', automl_trial_id
+    ))
+    
+    model_path.mkdir(parents=True, exist_ok=True)
+    
+    # 根据任务类型选择训练器
+    if project_task_type in ['classification', 'regression', 'anomaly_detection']:
+        # 结构化数据任务 - 使用ML训练器
+        from tasks import submit_ml_training_task
+        future = submit_ml_training_task(job_id, project_id, dataset_id, config_dict)
+    elif project_task_type == 'image_classification':
+        # 图像分类任务 - 使用PyTorch训练器
+        from tasks import submit_image_training_task
+        future = submit_image_training_task(job_id, project_id, dataset_id, config_dict)
+    elif project_task_type == 'object_detection':
+        # 目标检测任务 - 使用YOLOv8
+        from tasks import submit_object_detection_task
+        future = submit_object_detection_task(job_id, project_id, dataset_id, config_dict)
+    else:
+        # NLP任务 - 使用transformers训练器
+        from tasks import submit_training_task
+        future = submit_training_task(job_id, project_id, dataset_id, config_dict)
+    
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": "started",
+        "config": config_dict,
+        "websocket_url": f"/ws/training/{job_id}"
+    }
+
+@app.get("/api/projects/{project_id}/jobs")
+async def list_training_jobs(project_id: str):
+    rows = execute_query('''
+        SELECT id, model_name, status, progress, current_epoch, total_epochs,
+               current_loss, best_accuracy, best_val_loss, learning_rate,
+               early_stopped, stop_reason, created_at, started_at, completed_at
+        FROM training_jobs WHERE project_id = %s ORDER BY created_at DESC
+    ''', (project_id,))
+    
+    jobs = []
+    for row in rows:
+        jobs.append({
+            "id": row['id'],
+            "model_name": row['model_name'],
+            "status": row['status'],
+            "progress": row['progress'],
+            "current_epoch": row['current_epoch'],
+            "total_epochs": row['total_epochs'],
+            "current_loss": row['current_loss'],
+            "best_accuracy": row['best_accuracy'],
+            "best_val_loss": row['best_val_loss'],
+            "learning_rate": row['learning_rate'],
+            "early_stopped": bool(row['early_stopped']) if row['early_stopped'] is not None else False,
+            "stop_reason": row['stop_reason'],
+            "created_at": row['created_at'],
+            "started_at": row['started_at'],
+            "completed_at": row['completed_at']
+        })
+    
+    return {"jobs": jobs}
+
+@app.post("/api/projects/{project_id}/jobs/{job_id}/retry")
+async def retry_training_job(project_id: str, job_id: str):
+    """重试失败的任务"""
+    rows = execute_query('''
+        SELECT id, dataset_id, config, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    if job['status'] not in ['failed', 'pending']:
+        raise HTTPException(status_code=400, detail="只有失败或等待中的任务可以重试")
+    
+    # 重置任务状态
+    execute_update('''
+        UPDATE training_jobs 
+        SET status = 'pending', progress = 0, current_epoch = 0,
+            current_loss = NULL, best_accuracy = NULL, best_val_loss = NULL,
+            started_at = NULL, completed_at = NULL, error_message = NULL
+        WHERE id = %s
+    ''', (job_id,))
+    
+    # 重新提交任务
+    config = job['config']
+    if isinstance(config, str):
+        config = json.loads(config)
+    
+    # 根据任务类型选择训练器
+    project_rows = execute_query('SELECT task_type FROM projects WHERE id = %s', (project_id,))
+    if not project_rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    task_type = project_rows[0]['task_type']
+    
+    if task_type in ['classification', 'regression', 'anomaly_detection']:
+        from tasks import submit_ml_training_task
+        submit_ml_training_task.delay(job_id, project_id, job['dataset_id'], config)
+    elif task_type == 'image_classification':
+        from tasks import submit_image_training_task
+        submit_image_training_task.delay(job_id, project_id, job['dataset_id'], config)
+    elif task_type == 'object_detection':
+        from tasks import submit_object_detection_task
+        submit_object_detection_task.delay(job_id, project_id, job['dataset_id'], config)
+    else:
+        from tasks import submit_training_task
+        submit_training_task.delay(job_id, project_id, job['dataset_id'], config)
+    
+    return {"success": True, "message": "任务已重新提交"}
+
+@app.delete("/api/projects/{project_id}/jobs/{job_id}")
+async def delete_training_job(project_id: str, job_id: str):
+    """删除训练任务"""
+    rows = execute_query('''
+        SELECT id, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    if job['status'] == 'training':
+        raise HTTPException(status_code=400, detail="训练中的任务不能删除")
+    
+    # 删除相关数据
+    execute_update('DELETE FROM training_metrics WHERE job_id = %s', (job_id,))
+    execute_update('DELETE FROM model_checkpoints WHERE job_id = %s', (job_id,))
+    execute_update('DELETE FROM training_jobs WHERE id = %s', (job_id,))
+    
+    return {"success": True, "message": "任务已删除"}
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/logs")
+async def get_training_logs(project_id: str, job_id: str, lines: int = 50):
+    rows = execute_query('''
+        SELECT log_path FROM training_jobs WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows or not rows[0]['log_path']:
+        return {"logs": []}
+    
+    log_path = Path(rows[0]['log_path'])
+    if not log_path.exists():
+        return {"logs": []}
+    
+    # 读取最后N行
+    with open(log_path, 'r') as f:
+        all_lines = f.readlines()
+        return {"logs": all_lines[-lines:]}
+
+# 导入推理服务
+from inference_service import inference_service
+
+# 模型部署
+@app.post("/api/projects/{project_id}/jobs/{job_id}/deploy")
+async def deploy_model(project_id: str, job_id: str, deploy_type: str = Form("api")):
+    """部署模型为API服务或导出到Ollama"""
+    rows = execute_query('''
+        SELECT model_path, model_name, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    model_path = rows[0]['model_path']
+    model_name = rows[0]['model_name']
+    status = rows[0]['status']
+    
+    if status != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成，无法部署")
+    
+    if deploy_type == "api":
+        # API模式：加载模型到内存
+        try:
+            model_id = f"{project_id}/{job_id}"
+            inference_service.load_model(model_path, model_id)
+            
+            # 更新部署状态到数据库
+            execute_update('''
+                UPDATE training_jobs SET deployed = 1 WHERE id = %s
+            ''', (job_id,))
+            
+            return {
+                "success": True,
+                "deploy_type": "api",
+                "model_id": model_id,
+                "endpoint": f"/api/inference/{model_id}",
+                "status": "模型已加载到内存",
+                "loaded_models": inference_service.list_loaded_models()
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"部署失败: {str(e)}")
+    
+    elif deploy_type == "ollama":
+        # Ollama模式：导出到Ollama
+        return {
+            "success": True,
+            "deploy_type": "ollama",
+            "message": "Ollama导出功能开发中",
+            "model_path": model_path
+        }
+    
+    else:
+        raise HTTPException(status_code=400, detail="不支持的部署类型")
+
+
+# 已部署模型列表
+@app.get("/api/inference/models")
+async def list_deployed_models():
+    """列出已部署（已加载到内存）的模型"""
+    models = inference_service.list_loaded_models()
+    return {
+        "deployed_models": models,
+        "count": len(models)
+    }
+
+
+# 常驻内存预测API
+@app.post("/api/inference/{project_id}/{job_id}")
+async def inference_predict(project_id: str, job_id: str, text: str = Form(...)):
+    """
+    使用已部署的模型进行实时预测（模型常驻内存）
+    
+    优势：
+    - 毫秒级响应（50-100ms）
+    - 无需重复加载模型
+    - 支持高并发
+    """
+    model_id = f"{project_id}/{job_id}"
+    
+    # 检查模型是否已加载
+    if model_id not in inference_service.models:
+        # 尝试自动加载
+        rows = execute_query('''
+            SELECT model_path, status FROM training_jobs 
+            WHERE id = %s AND project_id = %s
+        ''', (job_id, project_id))
+        
+        if not rows:
+            raise HTTPException(status_code=404, detail="模型不存在")
+        
+        model_path = rows[0]['model_path']
+        status = rows[0]['status']
+        if status != 'completed':
+            raise HTTPException(status_code=400, detail="训练尚未完成")
+        
+        # 自动加载
+        try:
+            inference_service.load_model(model_path, model_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"模型加载失败: {str(e)}")
+    
+    # 执行预测
+    try:
+        result = inference_service.predict_single(text, model_id)
+        return {
+            "success": True,
+            "model_id": model_id,
+            "result": result,
+            "device": str(inference_service.device)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
+
+
+# 批量预测API
+@app.post("/api/inference/{project_id}/{job_id}/batch")
+async def inference_predict_batch(project_id: str, job_id: str, texts: List[str]):
+    """批量预测（模型常驻内存）"""
+    model_id = f"{project_id}/{job_id}"
+    
+    if model_id not in inference_service.models:
+        raise HTTPException(status_code=400, detail="模型未部署，请先调用部署接口")
+    
+    try:
+        results = inference_service.predict(texts, model_id)
+        return {
+            "success": True,
+            "model_id": model_id,
+            "count": len(results),
+            "results": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量预测失败: {str(e)}")
+
+
+# 卸载模型
+@app.delete("/api/inference/{project_id}/{job_id}")
+async def undeploy_model(project_id: str, job_id: str):
+    """卸载模型释放内存"""
+    model_id = f"{project_id}/{job_id}"
+    inference_service.unload_model(model_id)
+    
+    return {
+        "success": True,
+        "message": f"模型 {model_id} 已卸载",
+        "remaining_models": inference_service.list_loaded_models()
+    }
+
+# 模型预测
+@app.post("/api/predict/{project_id}/{job_id}")
+async def predict(project_id: str, job_id: str, text: str = Form(...)):
+    """使用训练好的模型进行预测"""
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import json
+    
+    # 获取模型路径
+    rows = execute_query('''
+        SELECT model_path, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    
+    model_path = rows[0]['model_path']
+    status = rows[0]['status']
+    if status != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成")
+    
+    final_model_path = Path(model_path) / "final"
+    label_mapping_path = Path(model_path) / "label_mapping.json"
+    
+    if not final_model_path.exists():
+        raise HTTPException(status_code=404, detail="模型文件不存在")
+    
+    # 加载标签映射
+    with open(label_mapping_path, 'r') as f:
+        label_map = json.load(f)
+    id2label = {int(k): v for k, v in label_map['id2label'].items()}
+    
+    # 加载模型和tokenizer
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tokenizer = AutoTokenizer.from_pretrained(str(final_model_path))
+    model = AutoModelForSequenceClassification.from_pretrained(str(final_model_path))
+    model.to(device)
+    model.eval()
+    
+    # 预测
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        pred_id = torch.argmax(probs, dim=-1).item()
+        confidence = probs[0][pred_id].item()
+    
+    # 构建所有类别的概率
+    all_probs = {id2label[i]: probs[0][i].item() for i in range(len(id2label))}
+    
+    return {
+        "prediction": id2label[pred_id],
+        "confidence": round(confidence, 4),
+        "all_probabilities": {k: round(v, 4) for k, v in all_probs.items()},
+        "input_text": text
+    }
+
+# ============ 增强版API：训练可视化与评估 ============
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/metrics")
+async def get_training_metrics_api(project_id: str, job_id: str, limit: int = 1000):
+    """获取训练指标历史（用于绘图）"""
+    # 验证任务存在
+    rows = execute_query('SELECT id FROM training_jobs WHERE id = %s AND project_id = %s', (job_id, project_id))
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    # 获取指标历史
+    rows = execute_query('''
+        SELECT epoch, step, train_loss, val_loss, train_accuracy, val_accuracy, learning_rate, created_at
+        FROM training_metrics
+        WHERE job_id = %s
+        ORDER BY step ASC
+        LIMIT %s
+    ''', (job_id, limit))
+    
+    metrics = []
+    for row in rows:
+        metrics.append({
+            "epoch": row['epoch'],
+            "step": row['step'],
+            "train_loss": row['train_loss'],
+            "val_loss": row['val_loss'],
+            "train_accuracy": row['train_accuracy'],
+            "val_accuracy": row['val_accuracy'],
+            "learning_rate": row['learning_rate'],
+            "created_at": row['created_at']
+        })
+    
+    return {"metrics": metrics, "count": len(metrics)}
+
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/report")
+async def get_evaluation_report(project_id: str, job_id: str):
+    """获取详细评估报告（混淆矩阵、F1/P/R等）"""
+    rows = execute_query('''
+        SELECT eval_report, best_accuracy, best_val_loss, early_stopped, stop_reason,
+               current_epoch, total_epochs, model_path, status
+        FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    row = rows[0]
+    eval_report_json = row['eval_report']
+    best_acc = row['best_accuracy']
+    best_loss = row['best_val_loss']
+    early_stopped = row['early_stopped']
+    stop_reason = row['stop_reason']
+    current_epoch = row['current_epoch']
+    total_epochs = row['total_epochs']
+    model_path = row['model_path']
+    status = row['status']
+    
+    # 解析评估报告
+    eval_report = eval_report_json if eval_report_json else {}
+    
+    return {
+        "job_id": job_id,
+        "status": status,
+        "summary": {
+            "best_accuracy": best_acc,
+            "best_val_loss": best_loss,
+            "epochs_trained": current_epoch,
+            "total_epochs": total_epochs,
+            "early_stopped": bool(early_stopped),
+            "stop_reason": stop_reason
+        },
+        "evaluation": eval_report,
+        "model_path": model_path
+    }
+
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/status")
+async def get_job_status_api(project_id: str, job_id: str):
+    """获取训练任务实时状态"""
+    rows = execute_query('''
+        SELECT id, model_name, status, progress, current_epoch, total_epochs,
+               current_loss, best_accuracy, best_val_loss, learning_rate,
+               early_stopped, stop_reason, created_at, started_at, completed_at
+        FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    row = rows[0]
+    return {
+        "id": row['id'],
+        "model_name": row['model_name'],
+        "status": row['status'],
+        "progress": row['progress'],
+        "current_epoch": row['current_epoch'],
+        "total_epochs": row['total_epochs'],
+        "current_loss": row['current_loss'],
+        "best_accuracy": row['best_accuracy'],
+        "best_val_loss": row['best_val_loss'],
+        "learning_rate": row['learning_rate'],
+        "early_stopped": bool(row['early_stopped']),
+        "stop_reason": row['stop_reason'],
+        "created_at": row['created_at'],
+        "started_at": row['started_at'],
+        "completed_at": row['completed_at']
+    }
+
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/checkpoints")
+async def list_model_checkpoints(project_id: str, job_id: str):
+    """列出模型检查点"""
+    rows = execute_query('''
+        SELECT id, epoch, step, metric_name, metric_value, file_path, is_best, created_at
+        FROM model_checkpoints
+        WHERE job_id = %s
+        ORDER BY created_at DESC
+    ''', (job_id,))
+    
+    checkpoints = []
+    for row in rows:
+        checkpoints.append({
+            "id": row['id'],
+            "epoch": row['epoch'],
+            "step": row['step'],
+            "metric_name": row['metric_name'],
+            "metric_value": row['metric_value'],
+            "file_path": row['file_path'],
+            "is_best": bool(row['is_best']),
+            "created_at": row['created_at']
+        })
+    
+    return {"checkpoints": checkpoints}
+
+
+# ============ WebSocket 实时训练监控 ============
+from fastapi import WebSocket, WebSocketDisconnect
+
+class WebSocketManager:
+    """WebSocket连接管理器"""
+    def __init__(self):
+        # job_id -> 一组WebSocket连接
+        self.active_connections: Dict[str, set] = {}
+    
+    async def connect(self, job_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if job_id not in self.active_connections:
+            self.active_connections[job_id] = set()
+        self.active_connections[job_id].add(websocket)
+    
+    def disconnect(self, job_id: str, websocket: WebSocket):
+        if job_id in self.active_connections:
+            self.active_connections[job_id].discard(websocket)
+            if not self.active_connections[job_id]:
+                del self.active_connections[job_id]
+    
+    async def broadcast(self, job_id: str, message: dict):
+        """广播消息给所有订阅该任务的客户端"""
+        if job_id not in self.active_connections:
+            return
+        
+        disconnected = set()
+        for connection in self.active_connections[job_id]:
+            try:
+                await connection.send_json(message)
+            except:
+                disconnected.add(connection)
+        
+        # 清理断开的连接
+        for conn in disconnected:
+            self.active_connections[job_id].discard(conn)
+
+
+# 创建全局WebSocket管理器
+ws_manager = WebSocketManager()
+
+# 设置到tasks模块（用于训练回调推送）
+import tasks
+tasks.set_websocket_manager(ws_manager)
+
+
+@app.websocket("/ws/training/{job_id}")
+async def training_websocket(websocket: WebSocket, job_id: str):
+    """WebSocket端点：实时接收训练更新"""
+    await ws_manager.connect(job_id, websocket)
+    
+    try:
+        # 发送初始状态
+        rows = execute_query('''
+            SELECT status, progress, current_epoch, total_epochs, current_loss, best_accuracy
+            FROM training_jobs WHERE id = %s
+        ''', (job_id,))
+        
+        if rows:
+            row = rows[0]
+            await websocket.send_json({
+                "type": "init",
+                "status": row['status'],
+                "progress": row['progress'],
+                "current_epoch": row['current_epoch'],
+                "total_epochs": row['total_epochs'],
+                "current_loss": row['current_loss'],
+                "best_accuracy": row['best_accuracy']
+            })
+        
+        # 保持连接，接收客户端消息（如暂停、取消等）
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                action = msg.get("action")
+                
+                if action == "ping":
+                    await websocket.send_json({"type": "pong"})
+                # 可以扩展：pause, resume, stop 等控制命令
+                
+            except json.JSONDecodeError:
+                pass
+                
+    except WebSocketDisconnect:
+        ws_manager.disconnect(job_id, websocket)
+
+
+# ============ 训练配置模板 ============
+
+TRAINING_TEMPLATES = {
+    "fast": {
+        "name": "快速训练",
+        "description": "适合快速验证，牺牲一定精度换取速度",
+        "config": {
+            "model_name": "distilbert-base-chinese",
+            "epochs": 3,
+            "batch_size": 32,
+            "learning_rate": 5e-5,
+            "max_length": 128,
+            "early_stopping": True,
+            "early_stopping_patience": 2
+        }
+    },
+    "balanced": {
+        "name": "均衡配置",
+        "description": "速度与精度的平衡，推荐日常使用",
+        "config": {
+            "model_name": "bert-base-chinese",
+            "epochs": 5,
+            "batch_size": 16,
+            "learning_rate": 2e-5,
+            "max_length": 256,
+            "early_stopping": True,
+            "early_stopping_patience": 3
+        }
+    },
+    "accurate": {
+        "name": "高精度",
+        "description": "追求最高精度，训练时间较长",
+        "config": {
+            "model_name": "chinese-roberta-wwm-ext",
+            "epochs": 10,
+            "batch_size": 8,
+            "learning_rate": 1e-5,
+            "max_length": 512,
+            "early_stopping": True,
+            "early_stopping_patience": 5
+        }
+    },
+    "tiny": {
+        "name": "超轻量",
+        "description": "极小模型，适合边缘设备",
+        "config": {
+            "model_name": "tiny-bert",
+            "epochs": 5,
+            "batch_size": 64,
+            "learning_rate": 5e-5,
+            "max_length": 128,
+            "early_stopping": False
+        }
+    }
+}
+
+
+@app.get("/api/training-templates")
+async def get_training_templates():
+    """获取预设训练配置模板"""
+    return {"templates": TRAINING_TEMPLATES}
+
+
+# ============ 修改训练启动接口（支持新配置）============
+
+@app.post("/api/projects/{project_id}/train")
+async def start_training_v2(
+    project_id: str,
+    dataset_id: str = Form(...),
+    config: str = Form(...),
+    template: Optional[str] = Form(None)
+):
+    """启动训练任务 - 增强版（支持模板）"""
+    
+    config_dict = json.loads(config)
+    
+    # 如果指定了模板，合并配置
+    if template and template in TRAINING_TEMPLATES:
+        template_config = TRAINING_TEMPLATES[template]["config"].copy()
+        template_config.update(config_dict)  # 用户配置覆盖模板
+        config_dict = template_config
+    
+    job_id = str(uuid.uuid4())
+    log_path = LOGS_DIR / f"{job_id}.log"
+    model_path = MODELS_DIR / project_id / f"{job_id}"
+    
+    execute_update('''
+        INSERT INTO training_jobs (
+            id, project_id, dataset_id, model_name, total_epochs, 
+            log_path, model_path, config, status
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (
+        job_id, project_id, dataset_id, config_dict.get("model_name", "bert-base-chinese"),
+        config_dict.get("epochs", 3), str(log_path), str(model_path),
+        json.dumps(config_dict), 'pending'
+    ))
+    
+    model_path.mkdir(parents=True, exist_ok=True)
+    
+    # 使用新版线程池任务（替代Celery）
+    from tasks import submit_training_task
+    future = submit_training_task(job_id, project_id, dataset_id, config_dict)
+    
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": "started",
+        "config": config_dict,
+        "websocket_url": f"/ws/training/{job_id}"
+    }
+
+
+# ============ 批量预测API ============
+
+@app.post("/api/projects/{project_id}/jobs/{job_id}/batch-predict")
+async def batch_predict(
+    project_id: str,
+    job_id: str,
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    批量预测 - 上传文件进行预测
+    
+    支持CSV/Excel文件，返回带预测结果的文件
+    """
+    # 获取任务信息
+    rows = execute_query('''
+        SELECT model_path, status, config FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    model_path = rows[0]['model_path']
+    status = rows[0]['status']
+    config_json = rows[0]['config']
+    
+    if status != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成")
+    
+    # 解析配置获取模型类型
+    config = json.loads(config_json) if config_json else {}
+    task_type = config.get('task_type', 'text_classification')
+    model_type = 'ml' if task_type in ['classification', 'regression', 'anomaly_detection'] else 'nlp'
+    
+    # 保存上传的文件
+    temp_dir = Path("/tmp/ai-training/batch")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    input_path = temp_dir / f"{job_id}_input_{file.filename}"
+    output_path = temp_dir / f"{job_id}_predictions.csv"
+    
+    with open(input_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    # 加载模型并预测
+    model_id = f"{project_id}/{job_id}"
+    try:
+        inference_service.load_model(model_path, model_id, model_type)
+        result = inference_service.predict_file(str(input_path), model_id, str(output_path))
+        
+        # 返回结果文件
+        return FileResponse(
+            path=output_path,
+            filename=f"predictions_{file.filename}",
+            media_type='text/csv'
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
+
+
+# ============ 内存监控API ============
+
+@app.get("/api/system/memory")
+async def get_memory_status():
+    """获取系统内存和模型加载状态"""
+    status = inference_service.get_memory_status()
+    return status
+
+
+@app.post("/api/inference/cleanup")
+async def cleanup_memory(keep_models: List[str] = None):
+    """
+    手动清理内存
+    
+    Args:
+        keep_models: 要保留的模型ID列表（可选）
+    """
+    status_before = inference_service.get_memory_status()
+    
+    # 卸载不需要的模型
+    loaded_models = inference_service.list_loaded_models()
+    for model in loaded_models:
+        if not keep_models or model['model_id'] not in keep_models:
+            inference_service.unload_model(model['model_id'])
+    
+    status_after = inference_service.get_memory_status()
+    
+    return {
+        "success": True,
+        "models_unloaded": len(loaded_models) - len(inference_service.list_loaded_models()),
+        "memory_before": f"{status_before['memory_percent']:.1f}%",
+        "memory_after": f"{status_after['memory_percent']:.1f}%",
+        "memory_freed_gb": status_before['memory_used_gb'] - status_after['memory_used_gb']
+    }
+
+
+# ============ 飞书通知配置API ============
+
+@app.get("/api/projects/{project_id}/feishu-notification")
+async def get_feishu_notification(project_id: str):
+    """获取飞书通知配置"""
+    rows = execute_query('''
+        SELECT id, webhook_url, notify_on_success, notify_on_failure
+        FROM feishu_notifications WHERE project_id = %s
+    ''', (project_id,))
+    
+    if not rows:
+        return {"enabled": False}
+    
+    row = rows[0]
+    return {
+        "enabled": True,
+        "id": row['id'],
+        "webhook_url": row['webhook_url'],
+        "notify_on_success": bool(row['notify_on_success']),
+        "notify_on_failure": bool(row['notify_on_failure'])
+    }
+
+
+@app.post("/api/projects/{project_id}/feishu-notification")
+async def set_feishu_notification(
+    project_id: str,
+    webhook_url: str = Form(...),
+    notify_on_success: bool = Form(True),
+    notify_on_failure: bool = Form(True)
+):
+    """设置飞书通知配置"""
+    # 检查是否已存在
+    rows = execute_query('SELECT id FROM feishu_notifications WHERE project_id = %s', (project_id,))
+    
+    if rows:
+        # 更新
+        execute_update('''
+            UPDATE feishu_notifications
+            SET webhook_url = %s, notify_on_success = %s, notify_on_failure = %s
+            WHERE project_id = %s
+        ''', (webhook_url, notify_on_success, notify_on_failure, project_id))
+    else:
+        # 创建
+        notification_id = str(uuid.uuid4())
+        execute_update('''
+            INSERT INTO feishu_notifications (id, project_id, webhook_url, notify_on_success, notify_on_failure)
+            VALUES (%s, %s, %s, %s, %s)
+        ''', (notification_id, project_id, webhook_url, notify_on_success, notify_on_failure))
+    
+    return {"success": True, "message": "飞书通知配置已保存"}
+
+
+@app.delete("/api/projects/{project_id}/feishu-notification")
+async def delete_feishu_notification(project_id: str):
+    """删除飞书通知配置"""
+    execute_update('DELETE FROM feishu_notifications WHERE project_id = %s', (project_id,))
+    
+    return {"success": True, "message": "飞书通知配置已删除"}
+
+
+# ============ 模型版本管理API ============
+
+@app.get("/api/projects/{project_id}/models")
+async def list_model_versions(project_id: str):
+    """列出项目的所有模型版本"""
+    rows = execute_query('''
+        SELECT id, model_name, status, best_accuracy, best_val_loss,
+               current_epoch, total_epochs, model_path, config, created_at, completed_at
+        FROM training_jobs 
+        WHERE project_id = %s AND status = 'completed'
+        ORDER BY created_at DESC
+    ''', (project_id,))
+    
+    models = []
+    for row in rows:
+        config = row['config'] if row['config'] else {}
+        
+        models.append({
+            "id": row['id'],
+            "name": row['model_name'],
+            "status": row['status'],
+            "best_accuracy": row['best_accuracy'],
+            "best_val_loss": row['best_val_loss'],
+            "epochs_trained": row['current_epoch'],
+            "total_epochs": row['total_epochs'],
+            "model_path": row['model_path'],
+            "config": config,
+            "created_at": row['created_at'],
+            "completed_at": row['completed_at'],
+            "is_deployed": f"{project_id}/{row['id']}" in [m['model_id'] for m in inference_service.list_loaded_models()]
+        })
+    
+    return {"models": models, "count": len(models)}
+
+
+@app.post("/api/projects/{project_id}/models/{job_id}/deploy")
+async def deploy_model_version(
+    project_id: str,
+    job_id: str,
+    deploy_type: str = Form("api")
+):
+    """部署指定版本的模型"""
+    rows = execute_query('''
+        SELECT model_path, config, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    
+    model_path = rows[0]['model_path']
+    config_json = rows[0]['config']
+    status = rows[0]['status']
+    
+    if status != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成")
+    
+    # 解析配置获取模型类型
+    config = json.loads(config_json) if config_json else {}
+    task_type = config.get('task_type', 'text_classification')
+    model_type = 'ml' if task_type in ['classification', 'regression', 'anomaly_detection'] else 'nlp'
+    
+    # 加载模型
+    model_id = f"{project_id}/{job_id}"
+    try:
+        inference_service.load_model(model_path, model_id, model_type)
+        
+        return {
+            "success": True,
+            "model_id": model_id,
+            "model_type": model_type,
+            "task_type": task_type,
+            "endpoint": f"/api/inference/{model_id}",
+            "status": "模型已加载到内存"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"部署失败: {str(e)}")
+
+
+@app.delete("/api/projects/{project_id}/models/{job_id}")
+async def delete_model_version(project_id: str, job_id: str):
+    """删除模型版本（从数据库和文件系统）"""
+    # 获取模型路径
+    rows = execute_query('''
+        SELECT model_path FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    
+    model_path = rows[0]['model_path']
+    
+    # 如果模型已加载，先卸载
+    model_id = f"{project_id}/{job_id}"
+    if model_id in [m['model_id'] for m in inference_service.list_loaded_models()]:
+        inference_service.unload_model(model_id)
+    
+    # 删除模型文件
+    import shutil
+    if Path(model_path).exists():
+        shutil.rmtree(model_path)
+    
+    # 删除数据库记录
+    execute_update('DELETE FROM training_jobs WHERE id = %s', (job_id,))
+    execute_update('DELETE FROM training_metrics WHERE job_id = %s', (job_id,))
+    
+    return {"success": True, "message": f"模型 {job_id} 已删除"}
+
+
+@app.get("/api/projects/{project_id}/models/compare")
+async def compare_models(project_id: str, model_ids: str = None):
+    """对比多个模型版本"""
+    if not model_ids:
+        raise HTTPException(status_code=400, detail="请指定要对比的模型ID")
+    
+    ids = model_ids.split(',')
+    
+    placeholders = ','.join(['%s' for _ in ids])
+    rows = execute_query(f'''
+        SELECT id, model_name, best_accuracy, best_val_loss, eval_report, config, created_at
+        FROM training_jobs 
+        WHERE project_id = %s AND id IN ({placeholders})
+    ''', (project_id, *ids))
+    
+    models = []
+    for row in rows:
+        models.append({
+            "id": row['id'],
+            "name": row['model_name'],
+            "best_accuracy": row['best_accuracy'],
+            "best_val_loss": row['best_val_loss'],
+            "eval_report": row['eval_report'] if row['eval_report'] else {},
+            "config": row['config'] if row['config'] else {},
+            "created_at": row['created_at']
+        })
+    
+    return {"models": models}
+
+
+# ============ 定时训练API ============
+
+@app.post("/api/projects/{project_id}/schedule")
+async def create_scheduled_training(
+    project_id: str,
+    schedule: str = Form(...),  # cron表达式或预设：daily, weekly
+    dataset_id: str = Form(...),
+    config: str = Form(...),
+    name: str = Form(...)
+):
+    """
+    创建定时训练任务
+    
+    schedule: cron表达式（如 "0 2 * * *" 每天2点）或预设 "daily", "weekly"
+    """
+    # 解析预设
+    if schedule == "daily":
+        cron = "0 2 * * *"  # 每天凌晨2点
+    elif schedule == "weekly":
+        cron = "0 2 * * 0"  # 每周日凌晨2点
+    else:
+        cron = schedule
+    
+    schedule_id = str(uuid.uuid4())
+    
+    # 确保表存在（PostgreSQL schema已包含此表）
+    execute_update('''
+        INSERT INTO training_schedules (id, project_id, name, dataset_id, config, cron_expression)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    ''', (schedule_id, project_id, name, dataset_id, config, cron))
+    
+    # 重新加载定时任务
+    reload_scheduler()
+    
+    return {
+        "success": True,
+        "schedule_id": schedule_id,
+        "cron": cron,
+        "message": "定时任务已创建"
+    }
+
+
+@app.get("/api/projects/{project_id}/schedules")
+async def list_schedules(project_id: str):
+    """列出项目的定时训练任务"""
+    # 确保表存在（PostgreSQL schema已包含此表）
+    rows = execute_query('''
+        SELECT id, name, dataset_id, cron_expression, is_active, last_run_at, next_run_at, created_at
+        FROM training_schedules 
+        WHERE project_id = %s
+        ORDER BY created_at DESC
+    ''', (project_id,))
+    
+    schedules = []
+    for row in rows:
+        schedules.append({
+            "id": row['id'],
+            "name": row['name'],
+            "dataset_id": row['dataset_id'],
+            "cron": row['cron_expression'],
+            "is_active": bool(row['is_active']),
+            "last_run_at": row['last_run_at'],
+            "next_run_at": row['next_run_at'],
+            "created_at": row['created_at']
+        })
+    return {"schedules": schedules}
+
+
+@app.delete("/api/projects/{project_id}/schedules/{schedule_id}")
+async def delete_schedule(project_id: str, schedule_id: str):
+    """删除定时任务"""
+    execute_update('DELETE FROM training_schedules WHERE id = %s AND project_id = %s', 
+                   (schedule_id, project_id))
+    
+    # 重新加载定时任务
+    reload_scheduler()
+    
+    return {"success": True, "message": "定时任务已删除"}
+
+
+# ============ 定时任务调度器 ============
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import logging
+
+logger = logging.getLogger(__name__)
+scheduler = BackgroundScheduler()
+
+def run_scheduled_training(schedule_id: str, project_id: str, dataset_id: str, config: str):
+    """执行定时训练"""
+    try:
+        config_dict = json.loads(config)
+        
+        # 生成新的job_id
+        job_id = str(uuid.uuid4())
+        
+        # 获取数据集路径
+        rows = execute_query("SELECT file_path FROM datasets WHERE id = %s", (dataset_id,))
+        
+        if rows:
+            # 创建训练任务
+            log_path = LOGS_DIR / f"{job_id}.log"
+            model_path = MODELS_DIR / project_id / f"{job_id}"
+            
+            execute_update('''
+                INSERT INTO training_jobs (id, project_id, dataset_id, model_name, total_epochs,
+                    log_path, model_path, config, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (job_id, project_id, dataset_id, config_dict.get('model_type', 'random_forest'),
+                  config_dict.get('epochs', 100), str(log_path), str(model_path),
+                  config, 'pending'))
+            
+            # 更新调度记录
+            execute_update('''
+                UPDATE training_schedules 
+                SET last_run_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            ''', (schedule_id,))
+            
+            # 启动训练
+            from tasks import submit_ml_training_task, submit_training_task
+            
+            task_type = config_dict.get('task_type', 'classification')
+            if task_type in ['classification', 'regression', 'anomaly_detection']:
+                submit_ml_training_task(job_id, project_id, dataset_id, config_dict)
+            else:
+                submit_training_task(job_id, project_id, dataset_id, config_dict)
+        
+    except Exception as e:
+        logger.error(f"定时训练执行失败: {e}")
+
+
+def reload_scheduler():
+    """重新加载所有定时任务"""
+    global scheduler
+    
+    # 移除所有现有任务
+    for job in scheduler.get_jobs():
+        job.remove()
+    
+    # 从数据库加载任务
+    try:
+        rows = execute_query('''
+            SELECT id, project_id, dataset_id, config, cron_expression
+            FROM training_schedules WHERE is_active = true
+        ''')
+        
+        for row in rows:
+            schedule_id, project_id, dataset_id, config, cron = row
+            
+            try:
+                trigger = CronTrigger.from_crontab(cron)
+                scheduler.add_job(
+                    run_scheduled_training,
+                    trigger=trigger,
+                    id=schedule_id,
+                    args=[schedule_id, project_id, dataset_id, config],
+                    replace_existing=True
+                )
+            except Exception as e:
+                logger.error(f"加载定时任务失败 {schedule_id}: {e}")
+    except Exception as e:
+        logger.error(f"重新加载调度器失败: {e}")
+
+
+# 启动时加载定时任务
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时初始化"""
+    scheduler.start()
+    reload_scheduler()
+    logger.info("定时任务调度器已启动")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """应用关闭时清理"""
+    scheduler.shutdown()
+    logger.info("定时任务调度器已关闭")
+
+
+# ============ 时序分析API ============
+
+@app.post("/api/projects/{project_id}/time-series/analyze")
+async def analyze_time_series(
+    project_id: str,
+    dataset_id: str = Form(...),
+    forecast_hours: int = Form(24),
+    time_col: Optional[str] = Form(None),
+    value_cols: Optional[str] = Form(None)
+):
+    """时序分析 - 趋势预测和异常检测
+    
+    Args:
+        time_col: 时间列名（可选，默认自动检测）
+        value_cols: 数值列名，逗号分隔（可选，默认自动检测）
+    """
+    from time_series_analyzer import analyze_equipment_trends
+    import pandas as pd
+    import os
+    
+    # 获取数据集路径
+    rows = execute_query("SELECT file_path FROM datasets WHERE id = %s", (dataset_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    file_path = rows[0]['file_path']
+    
+    # 检查文件是否存在
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"数据文件不存在: {file_path}")
+    
+    # 检查是否是文件夹
+    if os.path.isdir(file_path):
+        # 查找文件夹中的CSV/Excel文件
+        data_files = []
+        for f in os.listdir(file_path):
+            if f.endswith(('.csv', '.xlsx', '.xls')):
+                data_files.append(os.path.join(file_path, f))
+        
+        if not data_files:
+            raise HTTPException(
+                status_code=400, 
+                detail="该数据集是图片文件夹，不支持时序分析。时序分析适用于CSV/Excel格式的时间序列数据（如传感器数据）。"
+            )
+        
+        # 使用第一个找到的表格文件
+        file_path = data_files[0]
+        logger.info(f"从文件夹中找到数据文件: {file_path}")
+    
+    # 检查文件类型
+    file_ext = os.path.splitext(file_path)[1].lower()
+    
+    # 图片数据不支持时序分析
+    if file_ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
+        raise HTTPException(
+            status_code=400, 
+            detail="图片数据不支持时序分析。时序分析适用于CSV/Excel格式的时间序列数据（如传感器数据）。"
+        )
+    
+    # 文本数据不支持时序分析
+    if file_ext in ['.txt', '.json']:
+        raise HTTPException(
+            status_code=400,
+            detail="文本数据不支持时序分析。请先进行文本标注和训练，或使用表格类时序数据。"
+        )
+    
+    # 只支持CSV和Excel文件
+    if file_ext not in ['.csv', '.xlsx', '.xls']:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式({file_ext or '无扩展名'})。时序分析只支持CSV或Excel格式的表格数据。"
+        )
+    
+    try:
+        # 先尝试读取文件检查数据结构
+        try:
+            if file_path.endswith('.xlsx'):
+                df = pd.read_excel(file_path, nrows=5)
+            else:
+                df = pd.read_csv(file_path, nrows=5)
+        except Exception as e:
+            logger.error(f"读取数据文件失败: {e}")
+            raise HTTPException(status_code=400, detail=f"无法读取数据文件，请检查文件格式: {str(e)}")
+        
+        # 检查是否有数据
+        if df.empty:
+            raise HTTPException(status_code=400, detail="数据文件为空")
+        
+        # 检查是否有数值列
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            raise HTTPException(
+                status_code=400, 
+                detail="数据中没有数值列，无法进行趋势分析。请确保数据包含可分析的数值指标。"
+            )
+        
+        logger.info(f"开始时序分析: file={file_path}, columns={df.columns.tolist()}, numeric_cols={numeric_cols}")
+        
+        # 解析数值列列表
+        value_cols_list = None
+        if value_cols:
+            value_cols_list = [c.strip() for c in value_cols.split(',') if c.strip()]
+        
+        result = analyze_equipment_trends(
+            file_path, 
+            forecast_hours,
+            time_col=time_col,
+            value_cols=value_cols_list
+        )
+        
+        # 检查分析结果是否有错误
+        if 'error' in result:
+            logger.warning(f"时序分析返回错误: {result['error']}")
+            return {"success": False, "error": result['error'], "analysis": result}
+        
+        return {"success": True, "analysis": result}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"时序分析失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
+
+
+@app.post("/api/projects/{project_id}/time-series/rul")
+async def predict_rul(
+    project_id: str,
+    dataset_id: str = Form(...),
+    degradation_col: str = Form(...),
+    threshold: float = Form(...)
+):
+    """预测剩余使用寿命 (RUL)"""
+    from time_series_analyzer import TimeSeriesAnalyzer
+    import pandas as pd
+    
+    rows = execute_query("SELECT file_path FROM datasets WHERE id = %s", (dataset_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    file_path = rows[0]['file_path']
+    
+    # 检查是否是文件夹
+    if os.path.isdir(file_path):
+        # 查找文件夹中的CSV/Excel文件
+        data_files = []
+        for f in os.listdir(file_path):
+            if f.endswith(('.csv', '.xlsx', '.xls')):
+                data_files.append(os.path.join(file_path, f))
+        
+        if not data_files:
+            raise HTTPException(
+                status_code=400, 
+                detail="该数据集是图片文件夹，不支持RUL预测。RUL预测适用于CSV/Excel格式的时间序列数据。"
+            )
+        
+        # 使用第一个找到的表格文件
+        file_path = data_files[0]
+    
+    try:
+        df = pd.read_excel(file_path) if file_path.endswith('.xlsx') else pd.read_csv(file_path)
+        analyzer = TimeSeriesAnalyzer()
+        result = analyzer.predict_rul(df, 'timestamp', degradation_col, threshold)
+        return {"success": True, "rul": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RUL预测失败: {str(e)}")
+
+
+# ============ 在线学习API ============
+
+@app.post("/api/projects/{project_id}/models/{job_id}/online-learn")
+async def start_online_learning(
+    project_id: str,
+    job_id: str,
+    dataset_id: str = Form(...),
+    learning_type: str = Form("incremental")
+):
+    """启动在线学习"""
+    from online_learning import OnlineLearningManager
+    
+    manager = OnlineLearningManager()
+    
+    # 创建学习任务
+    task_id = manager.create_learning_task(project_id, job_id, learning_type)
+    
+    # 获取数据集路径
+    rows = execute_query("SELECT file_path FROM datasets WHERE id = %s", (dataset_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    # 执行增量学习
+    try:
+        result = manager.incremental_learn(task_id, rows[0]['file_path'])
+        return {"success": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"在线学习失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_id}/models/{job_id}/learning-history")
+async def get_learning_history(project_id: str, job_id: str):
+    """获取在线学习历史"""
+    from online_learning import OnlineLearningManager
+    
+    manager = OnlineLearningManager()
+    history = manager.get_learning_history(project_id, job_id)
+    
+    return {"history": history, "count": len(history)}
+
+
+@app.post("/api/projects/{project_id}/models/{job_id}/rollback")
+async def rollback_model(
+    project_id: str,
+    job_id: str,
+    target_version: Optional[str] = Form(None)
+):
+    """回滚模型到历史版本"""
+    from online_learning import OnlineLearningManager
+    
+    manager = OnlineLearningManager()
+    result = manager.rollback_model(job_id, target_version)
+    
+    if result['success']:
+        return result
+    else:
+        raise HTTPException(status_code=400, detail=result['message'])
+
+
+@app.post("/api/projects/{project_id}/models/{job_id}/auto-learn")
+async def setup_auto_learning(
+    project_id: str,
+    job_id: str,
+    schedule: str = Form("daily"),  # daily, weekly, never
+    min_samples: int = Form(100),
+    accuracy_threshold: float = Form(0.05)
+):
+    """设置自动在线学习"""
+    from online_learning import OnlineLearningManager
+    
+    manager = OnlineLearningManager()
+    config_id = manager.setup_auto_learning(
+        project_id, job_id, schedule, min_samples, accuracy_threshold
+    )
+    
+    return {
+        "success": True,
+        "config_id": config_id,
+        "schedule": schedule,
+        "min_samples": min_samples
+    }
+
+
+@app.get("/api/projects/{project_id}/auto-learning-config")
+async def get_auto_learning_config(project_id: str):
+    """获取自动学习配置"""
+    rows = execute_query('''
+        SELECT id, job_id, schedule, min_samples, accuracy_threshold, is_active
+        FROM auto_learning_config
+        WHERE project_id = %s
+    ''', (project_id,))
+    
+    configs = []
+    for row in rows:
+        configs.append({
+            "id": row['id'],
+            "job_id": row['job_id'],
+            "schedule": row['schedule'],
+            "min_samples": row['min_samples'],
+            "accuracy_threshold": row['accuracy_threshold'],
+            "is_active": bool(row['is_active'])
+        })
+    return {"configs": configs}
+
+
+# ============ DeepSeek 根因分析 API ============
+
+@app.post("/api/projects/{project_id}/analyze-root-cause")
+async def analyze_root_cause(
+    project_id: str,
+    sensor_data: str = Form(...),  # JSON字符串
+    prediction_result: str = Form(...)  # JSON字符串
+):
+    """
+    DeepSeek 故障根因分析
+    
+    当本地模型预测故障概率较高时，调用DeepSeek进行深度分析
+    """
+    from llm_integration import LLMService
+    
+    try:
+        data = json.loads(sensor_data)
+        prediction = json.loads(prediction_result)
+        
+        llm = LLMService('deepseek')
+        result = llm.analyze_equipment_report(data, prediction)
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"根因分析失败: {str(e)}")
+
+
+@app.post("/api/projects/{project_id}/generate-report")
+async def generate_maintenance_report(
+    project_id: str,
+    analysis_data: str = Form(...)  # JSON字符串，包含一段时间的分析结果
+):
+    """
+    生成维护报告
+    """
+    from llm_integration import LLMService
+    
+    try:
+        data_list = json.loads(analysis_data)
+        
+        llm = LLMService('deepseek')
+        result = llm.generate_maintenance_report(data_list)
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"报告生成失败: {str(e)}")
+
+
+@app.get("/api/llm/status")
+async def check_llm_status():
+    """检查大模型服务状态"""
+    from llm_integration import LLMService
+    
+    llm = LLMService('deepseek')
+    
+    return {
+        "provider": "deepseek",
+        "available": llm.api_key is not None,
+        "message": "API已配置" if llm.api_key else "未配置DEEPSEEK_API_KEY环境变量"
+    }
+
+
+# ============ Celery 任务队列管理 API ============
+
+@app.get("/api/celery/status")
+async def celery_status():
+    """检查 Celery 和 Redis 状态"""
+    try:
+        # 检查 Redis 连接
+        import redis
+        r = redis.from_url('redis://localhost:6379/0')
+        r.ping()
+        redis_status = "connected"
+    except Exception as e:
+        redis_status = f"error: {str(e)}"
+    
+    # 检查 Celery 任务统计
+    try:
+        inspector = celery_app.control.inspect()
+        active_tasks = inspector.active()
+        scheduled_tasks = inspector.scheduled()
+        
+        worker_count = len(active_tasks) if active_tasks else 0
+        active_count = sum(len(t) for t in active_tasks.values()) if active_tasks else 0
+        scheduled_count = sum(len(t) for t in scheduled_tasks.values()) if scheduled_tasks else 0
+        
+        return {
+            "celery_version": celery_app.__version__ if hasattr(celery_app, '__version__') else "unknown",
+            "redis_status": redis_status,
+            "worker_count": worker_count,
+            "active_tasks": active_count,
+            "scheduled_tasks": scheduled_count,
+            "broker_url": str(celery_app.conf.broker_url),
+            "result_backend": str(celery_app.conf.result_backend)
+        }
+    except Exception as e:
+        return {
+            "redis_status": redis_status,
+            "error": str(e),
+            "broker_url": str(celery_app.conf.broker_url)
+        }
+
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/celery-status")
+async def get_celery_task_status(project_id: str, job_id: str):
+    """获取 Celery 任务的详细状态"""
+    # 从数据库获取任务信息
+    rows = execute_query('''
+        SELECT id, status, model_name, progress, current_epoch, total_epochs,
+               best_accuracy, created_at, started_at, completed_at, stop_reason
+        FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    
+    # 尝试获取 Celery 任务状态
+    celery_info = {}
+    try:
+        # 通过任务ID查询Celery结果（如果任务是通过Celery提交的）
+        from celery.result import AsyncResult
+        result = AsyncResult(job_id, app=celery_app)
+        
+        if result.id:
+            celery_info = {
+                "celery_state": result.state,
+                "celery_result": result.result if result.ready() else None,
+            }
+    except Exception as e:
+        celery_info = {"error": str(e)}
+    
+    return {
+        "job": {
+            "id": job['id'],
+            "status": job['status'],
+            "model_name": job['model_name'],
+            "progress": job['progress'],
+            "current_epoch": job['current_epoch'],
+            "total_epochs": job['total_epochs'],
+            "best_accuracy": job['best_accuracy'],
+            "created_at": job['created_at'],
+            "started_at": job['started_at'],
+            "completed_at": job['completed_at'],
+            "stop_reason": job['stop_reason']
+        },
+        "celery": celery_info
+    }
+
+
+@app.post("/api/celery/retry-task")
+async def retry_celery_task(job_id: str = Form(...), project_id: str = Form(...)):
+    """重试失败的任务"""
+    # 获取任务信息
+    rows = execute_query('''
+        SELECT id, project_id, dataset_id, model_name, config
+        FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    
+    # 重置任务状态
+    execute_update('''
+        UPDATE training_jobs 
+        SET status = 'pending', progress = 0, current_epoch = 0, 
+            current_loss = NULL, stop_reason = NULL
+        WHERE id = %s
+    ''', (job_id,))
+    
+    # 重新提交任务
+    config = job['config'] if isinstance(job['config'], dict) else json.loads(job['config'])
+    
+    if config.get('task_type') == 'image_classification':  # 图片分类任务
+        future = submit_image_training_task(job_id, project_id, job['dataset_id'], config)
+    elif 'model_name' in config and config.get('task_type') != 'image_classification':  # NLP任务
+        future = submit_training_task(job_id, project_id, job['dataset_id'], config)
+    else:  # ML任务
+        future = submit_ml_training_task(job_id, project_id, job['dataset_id'], config)
+    
+    return {
+        "success": True,
+        "message": "任务已重新提交",
+        "celery_task_id": future.id if hasattr(future, 'id') else None
+    }
+
+
+# ============ 模型导出 API ============
+
+@app.get("/api/projects/{project_id}/models/{job_id}/export-formats")
+async def get_export_formats(project_id: str, job_id: str):
+    """获取模型可用的导出格式"""
+    rows = execute_query('''
+        SELECT model_path, config, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成")
+    
+    config = job['config'] if isinstance(job['config'], dict) else json.loads(job['config'])
+    
+    # 根据任务类型返回可用格式
+    formats = []
+    
+    if config.get('task_type') == 'image_classification':
+        formats = [
+            {"format": "pth", "name": "PyTorch模型", "ext": ".pth", "desc": "原始PyTorch格式"},
+            {"format": "onnx", "name": "ONNX", "ext": ".onnx", "desc": "跨平台推理格式"},
+            {"format": "quantized", "name": "INT8量化", "ext": "_quantized.pth", "desc": "压缩模型，适合边缘设备"}
+        ]
+    elif 'model_name' in config:  # NLP任务
+        formats = [
+            {"format": "pytorch", "name": "PyTorch", "ext": ".bin", "desc": "HuggingFace格式"},
+            {"format": "onnx", "name": "ONNX", "ext": ".onnx", "desc": "ONNX Runtime推理"}
+        ]
+    else:  # ML任务
+        formats = [
+            {"format": "pkl", "name": "Pickle", "ext": ".pkl", "desc": "Python序列化格式"},
+            {"format": "onnx", "name": "ONNX", "ext": ".onnx", "desc": "通用推理格式"}
+        ]
+    
+    return {"formats": formats}
+
+
+@app.post("/api/projects/{project_id}/models/{job_id}/export")
+async def export_model(
+    project_id: str,
+    job_id: str,
+    format: str = Form(...),
+    quantize: bool = Form(False)
+):
+    """
+    导出模型到指定格式
+    
+    Args:
+        format: 导出格式 (onnx, quantized, etc.)
+        quantize: 是否量化
+    """
+    rows = execute_query('''
+        SELECT model_path, config, status, task_type FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成")
+    
+    model_path = job['model_path']
+    config = job['config'] if isinstance(job['config'], dict) else json.loads(job['config'])
+    
+    export_results = []
+    
+    # 检查已有文件
+    model_dir = Path(model_path)
+    
+    if format == "onnx":
+        onnx_path = model_dir / "model.onnx"
+        if onnx_path.exists():
+            export_results.append({
+                "format": "onnx",
+                "path": str(onnx_path),
+                "size_mb": onnx_path.stat().st_size / (1024 * 1024)
+            })
+        else:
+            raise HTTPException(status_code=404, detail="ONNX模型不存在，可能训练时未生成")
+    
+    elif format == "quantized" or quantize:
+        # 执行INT8量化
+        quantized_path = model_dir / "model_quantized.pth"
+        if not quantized_path.exists():
+            result = quantize_model(
+                str(model_dir / "best_model.pth"),
+                str(quantized_path)
+            )
+            if not result['success']:
+                raise HTTPException(status_code=500, detail=f"量化失败: {result.get('error')}")
+        
+        export_results.append({
+            "format": "quantized",
+            "path": str(quantized_path),
+            "size_mb": quantized_path.stat().st_size / (1024 * 1024) if quantized_path.exists() else 0
+        })
+    
+    elif format == "pth" or format == "pytorch":
+        pth_path = model_dir / "best_model.pth"
+        if pth_path.exists():
+            export_results.append({
+                "format": "pth",
+                "path": str(pth_path),
+                "size_mb": pth_path.stat().st_size / (1024 * 1024)
+            })
+    
+    return {
+        "success": True,
+        "exports": export_results,
+        "download_url": f"/api/projects/{project_id}/models/{job_id}/download?format={format}"
+    }
+
+
+@app.get("/api/projects/{project_id}/models/{job_id}/download")
+async def download_model(
+    project_id: str,
+    job_id: str,
+    format: str = "pth"
+):
+    """下载导出的模型文件"""
+    rows = execute_query('''
+        SELECT model_path, config, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    model_dir = Path(job['model_path'])
+    
+    # 根据格式选择文件
+    file_map = {
+        "pth": model_dir / "best_model.pth",
+        "onnx": model_dir / "model.onnx",
+        "quantized": model_dir / "model_quantized.pth",
+        "final": model_dir / "final_model.pth"
+    }
+    
+    file_path = file_map.get(format, model_dir / "best_model.pth")
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"{format}格式模型文件不存在")
+    
+    return FileResponse(
+        file_path,
+        filename=f"model_{job_id[:8]}_{format}{file_path.suffix}",
+        media_type='application/octet-stream'
+    )
+
+
+# ============ XAI 可解释性 API ============
+
+@app.post("/api/xai/image/gradcam")
+async def explain_image_gradcam(
+    project_id: str = Form(...),
+    job_id: str = Form(...),
+    image: UploadFile = File(...),
+    target_layer: Optional[str] = Form(None)
+):
+    """
+    使用Grad-CAM解释图像分类预测
+    
+    返回热力图和叠加图(base64编码)
+    """
+    import torch
+    import torch.nn.functional as F
+    import cv2
+    import numpy as np
+    from torchvision import transforms, models
+    from PIL import Image as PILImage
+    from xai_explainer import GradCAMExplainer
+    
+    # 获取模型
+    rows = execute_query('''
+        SELECT model_path, config FROM training_jobs 
+        WHERE id = %s AND project_id = %s AND status = 'completed'
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在或训练未完成")
+    
+    job = rows[0]
+    model_path = Path(job['model_path']) / 'best_model.pth'
+    config = job['config'] if isinstance(job['config'], dict) else json.loads(job['config'])
+    
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail="模型文件不存在")
+    
+    try:
+        # 加载模型
+        checkpoint = torch.load(model_path, map_location='cpu')
+        
+        # 重建模型结构
+        model_name = config.get('model_name', 'resnet50')
+        num_classes = len(checkpoint.get('class_names', []))
+        
+        if 'resnet' in model_name:
+            model = getattr(models, model_name)(pretrained=False)
+            model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+        elif 'efficientnet' in model_name:
+            model = getattr(models, model_name)(pretrained=False)
+            model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, num_classes)
+        elif 'mobilenet' in model_name:
+            model = getattr(models, model_name)(pretrained=False)
+            model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, num_classes)
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的模型类型: {model_name}")
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        # 读取上传的图片
+        image_bytes = await image.read()
+        pil_img = PILImage.open(io.BytesIO(image_bytes)).convert('RGB')
+        
+        # 预处理
+        image_size = config.get('image_size', 224)
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        image_tensor = transform(pil_img).unsqueeze(0)
+        image_array = np.array(pil_img.resize((image_size, image_size)))
+        
+        # 创建解释器
+        explainer = GradCAMExplainer(model, target_layer)
+        
+        # 生成解释
+        with torch.enable_grad():
+            heatmap = explainer.generate_heatmap(image_tensor)
+        
+        # 获取预测
+        with torch.no_grad():
+            output = model(image_tensor)
+            probs = F.softmax(output, dim=1)
+            target_class = output.argmax(dim=1).item()
+            confidence = probs[0, target_class].item()
+        
+        class_names = checkpoint.get('class_names', [f'class_{i}' for i in range(num_classes)])
+        
+        # 可视化
+        overlay = explainer.visualize(image_array, heatmap)
+        
+        # 转为base64
+        def array_to_base64(arr: np.ndarray) -> str:
+            pil_img = PILImage.fromarray(arr)
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format='PNG')
+            return 'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode()
+        
+        # 热力图单独保存
+        heatmap_colored = cv2.applyColorMap(
+            (heatmap * 255).astype(np.uint8), 
+            cv2.COLORMAP_JET
+        )
+        heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+        
+        return {
+            "success": True,
+            "prediction": {
+                "class_id": target_class,
+                "class_name": class_names[target_class],
+                "confidence": confidence
+            },
+            "heatmap": array_to_base64(heatmap_colored),
+            "overlay": array_to_base64(overlay),
+            "original": array_to_base64(image_array),
+            "model_info": {
+                "model_name": model_name,
+                "target_layer": explainer.target_layer
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Grad-CAM解释失败: {e}")
+        raise HTTPException(status_code=500, detail=f"解释失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}/xai/feature-importance")
+async def get_feature_importance(project_id: str, job_id: str):
+    """
+    获取表格数据模型的特征重要性
+    
+    支持：RandomForest的feature_importances_，或SHAP值
+    """
+    import pickle
+    
+    rows = execute_query('''
+        SELECT model_path, config, task_type FROM training_jobs 
+        WHERE id = %s AND project_id = %s AND status = 'completed'
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在或训练未完成")
+    
+    job = rows[0]
+    model_dir = Path(job['model_path'])
+    
+    # 尝试加载不同格式的模型
+    model = None
+    feature_names = []
+    
+    # 1. 尝试pickle格式
+    pkl_path = model_dir / 'model.pkl'
+    if pkl_path.exists():
+        with open(pkl_path, 'rb') as f:
+            model = pickle.load(f)
+    
+    # 2. 尝试joblib格式
+    if model is None:
+        joblib_path = model_dir / 'model.joblib'
+        if joblib_path.exists():
+            import joblib
+            model = joblib.load(joblib_path)
+    
+    if model is None:
+        raise HTTPException(status_code=404, detail="找不到可解释的模型文件")
+    
+    # 获取特征重要性
+    importance_data = []
+    
+    # RandomForest / GradientBoosting
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+        config = job['config'] if isinstance(job['config'], dict) else json.loads(job['config'])
+        feature_cols = config.get('feature_columns', [])
+        
+        if not feature_cols:
+            feature_cols = [f'feature_{i}' for i in range(len(importances))]
+        
+        importance_data = [
+            {"feature": name, "importance": float(imp)}
+            for name, imp in zip(feature_cols, importances)
+        ]
+        importance_data.sort(key=lambda x: x['importance'], reverse=True)
+    
+    # Linear models (coef_)
+    elif hasattr(model, 'coef_'):
+        coefs = np.abs(model.coef_).mean(axis=0) if model.coef_.ndim > 1 else np.abs(model.coef_)
+        config = job['config'] if isinstance(job['config'], dict) else json.loads(job['config'])
+        feature_cols = config.get('feature_columns', [f'feature_{i}' for i in range(len(coefs))])
+        
+        importance_data = [
+            {"feature": name, "importance": float(coef)}
+            for name, coef in zip(feature_cols, coefs)
+        ]
+        importance_data.sort(key=lambda x: x['importance'], reverse=True)
+    
+    return {
+        "success": True,
+        "model_type": type(model).__name__,
+        "feature_importance": importance_data[:20],  # 前20个
+        "total_features": len(importance_data)
+    }
+
+
+@app.post("/api/xai/text/attention")
+async def explain_text_attention(
+    project_id: str = Form(...),
+    job_id: str = Form(...),
+    text: str = Form(...)
+):
+    """
+    解释文本分类的Attention权重
+    
+    返回每个token的attention权重
+    """
+    # 简化版：返回分词和模拟权重
+    # 实际实现需要加载Transformer模型获取真实attention
+    
+    tokens = text[:200]  # 限制长度
+    
+    return {
+        "success": True,
+        "text": text,
+        "tokens": [{"token": c, "weight": 0.1, "index": i} for i, c in enumerate(tokens)],
+        "note": "这是简化版，完整版需要加载Transformer模型获取Attention权重"
+    }
+
+
+# ============ 告警规则 API ============
+
+@app.get("/api/projects/{project_id}/alert-rules")
+async def list_alert_rules(project_id: str):
+    """获取项目的所有告警规则"""
+    # 验证项目存在
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    rules = get_project_alert_rules(project_id)
+    return {"rules": rules, "count": len(rules)}
+
+
+@app.post("/api/projects/{project_id}/alert-rules")
+async def create_alert_rule(
+    project_id: str,
+    name: str = Form(...),
+    description: str = Form(""),
+    rule_type: str = Form(...),
+    condition_field: str = Form(...),
+    condition_operator: str = Form(...),
+    condition_value: float = Form(...),
+    severity: str = Form("warning"),
+    cooldown_minutes: int = Form(60),
+    notify_channels: str = Form("[\"feishu\"]")
+):
+    """创建告警规则"""
+    # 验证项目存在
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    try:
+        channels = json.loads(notify_channels)
+    except:
+        channels = ["feishu"]
+    
+    rule_id = AlertEngine.create_rule(
+        project_id=project_id,
+        name=name,
+        description=description,
+        rule_type=rule_type,
+        condition_field=condition_field,
+        condition_operator=condition_operator,
+        condition_value=condition_value,
+        severity=severity,
+        notify_channels=channels
+    )
+    
+    # 更新冷却时间
+    execute_update('''
+        UPDATE alert_rules SET cooldown_minutes = %s WHERE id = %s
+    ''', (cooldown_minutes, rule_id))
+    
+    return {"success": True, "rule_id": rule_id, "message": "告警规则创建成功"}
+
+
+@app.post("/api/projects/{project_id}/alert-rules/template")
+async def create_alert_rule_from_template(
+    project_id: str,
+    template_key: str = Form(...),
+    custom_values: str = Form("{}")
+):
+    """从模板创建告警规则"""
+    # 验证项目存在
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    try:
+        custom = json.loads(custom_values)
+    except:
+        custom = {}
+    
+    try:
+        rule_id = AlertEngine.create_rule_from_template(
+            project_id=project_id,
+            template_key=template_key,
+            custom_values=custom
+        )
+        return {"success": True, "rule_id": rule_id, "message": "从模板创建成功"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/projects/{project_id}/alert-rules/{rule_id}")
+async def update_alert_rule(
+    project_id: str,
+    rule_id: str,
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    condition_value: Optional[float] = Form(None),
+    severity: Optional[str] = Form(None),
+    enabled: Optional[bool] = Form(None),
+    cooldown_minutes: Optional[int] = Form(None)
+):
+    """更新告警规则"""
+    # 验证规则存在
+    rows = execute_query(
+        'SELECT id FROM alert_rules WHERE id = %s AND project_id = %s',
+        (rule_id, project_id)
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="告警规则不存在")
+    
+    updates = []
+    values = []
+    
+    if name:
+        updates.append("name = %s")
+        values.append(name)
+    if description is not None:
+        updates.append("description = %s")
+        values.append(description)
+    if condition_value is not None:
+        updates.append("condition_value = %s")
+        values.append(condition_value)
+    if severity:
+        updates.append("severity = %s")
+        values.append(severity)
+    if enabled is not None:
+        updates.append("enabled = %s")
+        values.append(enabled)
+    if cooldown_minutes is not None:
+        updates.append("cooldown_minutes = %s")
+        values.append(cooldown_minutes)
+    
+    if updates:
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        query = f"UPDATE alert_rules SET {', '.join(updates)} WHERE id = %s"
+        values.append(rule_id)
+        execute_update(query, tuple(values))
+    
+    return {"success": True, "message": "告警规则更新成功"}
+
+
+@app.delete("/api/projects/{project_id}/alert-rules/{rule_id}")
+async def delete_alert_rule(project_id: str, rule_id: str):
+    """删除告警规则"""
+    rows = execute_query(
+        'SELECT id FROM alert_rules WHERE id = %s AND project_id = %s',
+        (rule_id, project_id)
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="告警规则不存在")
+    
+    execute_update('DELETE FROM alert_rules WHERE id = %s', (rule_id,))
+    return {"success": True, "message": "告警规则已删除"}
+
+
+@app.get("/api/projects/{project_id}/alerts")
+async def list_alerts(
+    project_id: str,
+    status: Optional[str] = None,
+    limit: int = 50
+):
+    """获取告警历史"""
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    alerts = get_alert_history(project_id, status, limit)
+    return {"alerts": alerts, "count": len(alerts)}
+
+
+@app.post("/api/projects/{project_id}/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(project_id: str, alert_id: str):
+    """确认告警"""
+    rows = execute_query(
+        'SELECT id FROM alert_history WHERE id = %s AND project_id = %s',
+        (alert_id, project_id)
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="告警不存在")
+    
+    execute_update('''
+        UPDATE alert_history 
+        SET status = 'acknowledged', 
+            resolved_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+    ''', (alert_id,))
+    
+    return {"success": True, "message": "告警已确认"}
+
+
+@app.post("/api/projects/{project_id}/alerts/{alert_id}/resolve")
+async def resolve_alert(project_id: str, alert_id: str):
+    """解决告警"""
+    rows = execute_query(
+        'SELECT id FROM alert_history WHERE id = %s AND project_id = %s',
+        (alert_id, project_id)
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="告警不存在")
+    
+    execute_update('''
+        UPDATE alert_history 
+        SET status = 'resolved', 
+            resolved_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+    ''', (alert_id,))
+    
+    return {"success": True, "message": "告警已解决"}
+
+
+@app.get("/api/alert-templates")
+async def get_alert_templates():
+    """获取告警规则模板列表"""
+    templates = AlertEngine.RULE_TEMPLATES
+    return {
+        "templates": [
+            {
+                "key": key,
+                "name": template["name"],
+                "description": template["description"],
+                "rule_type": template["rule_type"],
+                "severity": template["severity"],
+                "default_threshold": template.get("condition_value")
+            }
+            for key, template in templates.items()
+        ]
+    }
+
+
+# 在训练完成时自动检查告警
+@app.post("/api/projects/{project_id}/jobs/{job_id}/check-alerts")
+async def manual_check_alerts(project_id: str, job_id: str):
+    """手动触发告警检查（用于测试）"""
+    try:
+        AlertEngine.check_training_alerts(job_id, project_id)
+        return {"success": True, "message": "告警检查已触发"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ 数据标注 API ============
+
+@app.get("/api/projects/{project_id}/datasets/{dataset_id}/images")
+async def get_dataset_images(project_id: str, dataset_id: str):
+    """获取数据集图片列表"""
+    # 验证项目存在
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    # 获取数据集路径
+    rows = execute_query('SELECT file_path FROM datasets WHERE id = %s AND project_id = %s', 
+                        (dataset_id, project_id))
+    if not rows:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    
+    dataset_path = rows[0]['file_path']
+    
+    # 扫描图片文件
+    import os
+    from pathlib import Path
+    
+    images = []
+    path = Path(dataset_path)
+    if path.exists():
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+            for img_path in path.rglob(ext):
+                # 获取相对路径
+                rel_path = img_path.relative_to(path)
+                images.append({
+                    'id': str(rel_path).replace('/', '_').replace('\\', '_'),
+                    'path': str(rel_path),
+                    'filename': img_path.name,
+                    'class': rel_path.parts[0] if len(rel_path.parts) > 1 else 'unknown'
+                })
+    
+    return {"images": images, "count": len(images), "dataset_path": dataset_path}
+
+
+@app.post("/api/projects/{project_id}/annotation-tasks")
+async def create_annotation_task(
+    project_id: str,
+    dataset_id: str = Form(...),
+    name: str = Form(...),
+    task_type: str = Form("bbox"),
+    classes: str = Form("[]")
+):
+    """创建标注任务"""
+    import uuid
+    
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    task_id = str(uuid.uuid4())
+    
+    # 获取图片数量
+    images_res = await get_dataset_images(project_id, dataset_id)
+    total_images = images_res["count"]
+    
+    execute_update("""
+        INSERT INTO annotation_tasks (id, project_id, dataset_id, name, task_type, classes, total_images)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (task_id, project_id, dataset_id, name, task_type, classes, total_images))
+    
+    # 初始化annotations记录
+    for img in images_res["images"]:
+        anno_id = str(uuid.uuid4())
+        execute_update("""
+            INSERT INTO annotations (id, task_id, image_id, image_path, status)
+            VALUES (%s, %s, %s, %s, 'pending')
+        """, (anno_id, task_id, img['id'], img['path']))
+    
+    return {"success": True, "task_id": task_id, "total_images": total_images}
+
+
+@app.get("/api/projects/{project_id}/annotation-tasks")
+async def list_annotation_tasks(project_id: str):
+    """获取标注任务列表"""
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    tasks = execute_query("""
+        SELECT t.*, d.name as dataset_name,
+               (SELECT COUNT(*) FROM annotations WHERE task_id = t.id AND status = 'annotated') as annotated_count
+        FROM annotation_tasks t
+        JOIN datasets d ON t.dataset_id = d.id
+        WHERE t.project_id = %s
+        ORDER BY t.created_at DESC
+    """, (project_id,))
+    
+    return {"tasks": [dict(row) for row in tasks], "count": len(tasks)}
+
+
+@app.get("/api/annotation-tasks/{task_id}/images")
+async def get_task_images(task_id: str, status: str = None):
+    """获取任务图片列表"""
+    if status:
+        rows = execute_query("""
+            SELECT * FROM annotations 
+            WHERE task_id = %s AND status = %s
+            ORDER BY created_at
+        """, (task_id, status))
+    else:
+        rows = execute_query("""
+            SELECT * FROM annotations 
+            WHERE task_id = %s
+            ORDER BY created_at
+        """, (task_id,))
+    
+    return {"images": [dict(row) for row in rows], "count": len(rows)}
+
+
+@app.get("/api/annotation-tasks/{task_id}/images/{image_id}")
+async def get_image_annotation(task_id: str, image_id: str):
+    """获取单张图片的标注"""
+    rows = execute_query("""
+        SELECT a.*, t.dataset_id, d.file_path as dataset_path
+        FROM annotations a
+        JOIN annotation_tasks t ON a.task_id = t.id
+        JOIN datasets d ON t.dataset_id = d.id
+        WHERE a.task_id = %s AND a.image_id = %s
+    """, (task_id, image_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    
+    return dict(rows[0])
+
+
+@app.post("/api/annotation-tasks/{task_id}/images/{image_id}/annotate")
+async def save_annotation(
+    task_id: str,
+    image_id: str,
+    objects: str = Form(...),  # JSON string of objects
+    time_spent: int = Form(0)
+):
+    """保存标注结果"""
+    import json
+    
+    try:
+        objects_data = json.loads(objects)
+    except:
+        raise HTTPException(status_code=400, detail="objects格式错误")
+    
+    execute_update("""
+        UPDATE annotations 
+        SET objects = %s, 
+            status = 'annotated',
+            time_spent = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE task_id = %s AND image_id = %s
+    """, (json.dumps(objects_data), time_spent, task_id, image_id))
+    
+    # 更新任务进度
+    execute_update("""
+        UPDATE annotation_tasks 
+        SET annotated_count = (
+            SELECT COUNT(*) FROM annotations WHERE task_id = %s AND status = 'annotated'
+        ),
+        status = CASE 
+            WHEN annotated_count = total_images THEN 'completed'
+            WHEN annotated_count > 0 THEN 'in_progress'
+            ELSE 'pending'
+        END
+        WHERE id = %s
+    """, (task_id, task_id))
+    
+    return {"success": True, "message": "标注已保存"}
+
+
+@app.post("/api/annotation-tasks/{task_id}/export")
+async def export_annotations(task_id: str, format: str = Form("yolo")):
+    """导出标注结果为YOLO格式"""
+    import json
+    from pathlib import Path
+    
+    # 获取任务信息
+    rows = execute_query("""
+        SELECT t.*, d.file_path as dataset_path
+        FROM annotation_tasks t
+        JOIN datasets d ON t.dataset_id = d.id
+        WHERE t.id = %s
+    """, (task_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task = rows[0]
+    dataset_path = Path(task['dataset_path'])
+    
+    # 创建导出目录
+    export_dir = dataset_path / f"labels_{format}"
+    export_dir.mkdir(exist_ok=True)
+    
+    # 获取所有标注
+    annotations = execute_query("""
+        SELECT * FROM annotations WHERE task_id = %s AND status = 'annotated'
+    """, (task_id,))
+    
+    classes = task['classes'] if isinstance(task['classes'], list) else json.loads(task['classes'])
+    class_to_id = {cls: i for i, cls in enumerate(classes)}
+    
+    # 导出为YOLO格式
+    for anno in annotations:
+        objects = anno['objects'] if isinstance(anno['objects'], list) else json.loads(anno['objects'])
+        
+        # YOLO格式: class_id center_x center_y width height (归一化)
+        yolo_lines = []
+        for obj in objects:
+            cls = obj.get('class', 'unknown')
+            class_id = class_to_id.get(cls, 0)
+            bbox = obj.get('bbox', {})  # {x, y, width, height} (归一化0-1)
+            
+            x = bbox.get('x', 0) + bbox.get('width', 0) / 2  # center x
+            y = bbox.get('y', 0) + bbox.get('height', 0) / 2  # center y
+            w = bbox.get('width', 0)
+            h = bbox.get('height', 0)
+            
+            yolo_lines.append(f"{class_id} {x:.6f} {y:.6f} {w:.6f} {h:.6f}")
+        
+        # 保存文件
+        image_path = Path(anno['image_path'])
+        label_file = export_dir / f"{image_path.stem}.txt"
+        label_file.write_text('\n'.join(yolo_lines))
+    
+    # 保存类别文件
+    classes_file = export_dir / "classes.txt"
+    classes_file.write_text('\n'.join(classes))
+    
+    return {
+        "success": True,
+        "export_dir": str(export_dir),
+        "format": format,
+        "annotated_count": len(annotations),
+        "classes": classes
+    }
+
+
+# ============ AutoML API ============
+
+@app.get("/api/projects/{project_id}/automl/search-spaces")
+async def get_search_spaces(project_id: str):
+    """获取可用的搜索空间配置"""
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    return {
+        "search_spaces": AutoMLConfig.SEARCH_SPACES,
+        "message": "各任务类型的超参数搜索空间"
+    }
+
+
+@app.post("/api/projects/{project_id}/automl/experiments")
+async def create_automl_experiment_api(
+    project_id: str,
+    dataset_id: str = Form(...),
+    name: str = Form(...),
+    max_trials: int = Form(20),
+    base_config: str = Form("{}")
+):
+    """创建AutoML实验"""
+    # 验证项目存在
+    rows = execute_query('SELECT id, task_type FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    task_type = rows[0]['task_type'] or 'text_classification'
+    
+    try:
+        config = json.loads(base_config)
+    except:
+        config = {}
+    
+    # 根据数据集自动推断任务类型（如果没有指定）
+    if not task_type or task_type == 'text_classification':
+        # 检查数据集类型
+        ds_rows = execute_query('SELECT file_type FROM datasets WHERE id = %s', (dataset_id,))
+        if ds_rows:
+            file_type = ds_rows[0]['file_type']
+            if file_type in ['csv', 'xlsx', 'xls']:
+                # 结构化数据，使用 ML 任务
+                task_type = 'classification'
+    
+    experiment_id = create_automl_experiment(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        name=name,
+        base_config=config,
+        task_type=task_type,
+        max_trials=max_trials
+    )
+    
+    return {
+        "success": True,
+        "experiment_id": experiment_id,
+        "message": f"AutoML实验已创建，将运行{max_trials}组超参数搜索"
+    }
+
+
+@app.get("/api/projects/{project_id}/automl/experiments")
+async def list_automl_experiments(project_id: str):
+    """获取项目的AutoML实验列表"""
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    experiments = execute_query("""
+        SELECT e.*, d.name as dataset_name,
+               (SELECT COUNT(*) FROM automl_trials WHERE experiment_id = e.id) as trials_count
+        FROM automl_experiments e
+        JOIN datasets d ON e.dataset_id = d.id
+        WHERE e.project_id = %s
+        ORDER BY e.created_at DESC
+    """, (project_id,))
+    
+    return {
+        "experiments": [dict(row) for row in experiments],
+        "count": len(experiments)
+    }
+
+
+@app.get("/api/automl/experiments/{experiment_id}")
+async def get_experiment_detail(experiment_id: str):
+    """获取实验详情"""
+    rows = execute_query("""
+        SELECT e.*, d.name as dataset_name
+        FROM automl_experiments e
+        JOIN datasets d ON e.dataset_id = d.id
+        WHERE e.id = %s
+    """, (experiment_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    
+    experiment = dict(rows[0])
+    
+    # 获取所有trials
+    trials = execute_query("""
+        SELECT * FROM automl_trials
+        WHERE experiment_id = %s
+        ORDER BY trial_number
+    """, (experiment_id,))
+    
+    experiment['trials'] = [dict(t) for t in trials]
+    
+    return {"experiment": experiment}
+
+
+@app.post("/api/automl/experiments/{experiment_id}/run")
+async def run_automl_experiment(experiment_id: str):
+    """运行AutoML实验（生成一组超参数）"""
+    rows = execute_query("""
+        SELECT * FROM automl_experiments WHERE id = %s
+    """, (experiment_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    
+    exp = rows[0]
+    
+    if exp['current_trial'] >= exp['max_trials']:
+        return {"success": False, "message": "实验已完成所有trial"}
+    
+    # 更新状态为running
+    execute_update("""
+        UPDATE automl_experiments SET status = 'running' WHERE id = %s
+    """, (experiment_id,))
+    
+    next_trial = exp['current_trial'] + 1
+    
+    # 生成超参数并创建trial记录
+    result = run_automl_trial(experiment_id, next_trial)
+    
+    # 更新当前trial数
+    execute_update("""
+        UPDATE automl_experiments SET current_trial = %s WHERE id = %s
+    """, (next_trial, experiment_id))
+    
+    # 如果所有trials都生成完成，更新状态为ready（等待训练）
+    if next_trial >= exp['max_trials']:
+        execute_update("""
+            UPDATE automl_experiments SET status = 'ready' WHERE id = %s
+        """, (experiment_id,))
+    
+    return {
+        "success": True,
+        "trial_id": result['trial_id'],
+        "trial_number": result['trial_num'],
+        "params": result['params'],
+        "message": f"第{next_trial}组超参数已生成，请使用这些参数提交训练任务"
+    }
+
+
+@app.post("/api/automl/trials/{trial_id}/status")
+async def update_trial_status(
+    trial_id: str,
+    status: str = Form(...),
+    job_id: str = Form(None)
+):
+    """更新trial状态（用于启动训练时更新为running）"""
+    rows = execute_query("SELECT * FROM automl_trials WHERE id = %s", (trial_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="trial不存在")
+    
+    execute_update("""
+        UPDATE automl_trials 
+        SET status = %s, job_id = %s
+        WHERE id = %s
+    """, (status, job_id, trial_id))
+    
+    return {"success": True, "message": f"trial状态已更新为{status}"}
+
+
+@app.post("/api/automl/trials/{trial_id}/record")
+async def record_trial_result(
+    trial_id: str,
+    metrics: str = Form(...),
+    job_id: str = Form(None)
+):
+    """记录trial的训练结果"""
+    try:
+        metrics_data = json.loads(metrics)
+    except:
+        raise HTTPException(status_code=400, detail="metrics格式错误")
+    
+    # 获取trial信息
+    rows = execute_query("SELECT * FROM automl_trials WHERE id = %s", (trial_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="trial不存在")
+    
+    # 更新metrics和状态
+    execute_update("""
+        UPDATE automl_trials 
+        SET metrics = %s, job_id = %s, status = 'completed', completed_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+    """, (json.dumps(metrics_data), job_id, trial_id))
+    
+    # 更新实验的最佳结果
+    accuracy = metrics_data.get('accuracy', 0)
+    trial = rows[0]
+    
+    # 检查是否是最佳
+    exp_rows = execute_query("SELECT best_accuracy FROM automl_experiments WHERE id = %s", 
+                            (trial['experiment_id'],))
+    if exp_rows:
+        current_best = exp_rows[0]['best_accuracy'] or 0
+        if accuracy > current_best:
+            execute_update("""
+                UPDATE automl_experiments 
+                SET best_accuracy = %s, best_trial_id = %s
+                WHERE id = %s
+            """, (accuracy, trial_id, trial['experiment_id']))
+    
+    return {"success": True, "message": "trial结果已记录"}
+
+
+@app.get("/api/automl/experiments/{experiment_id}/comparison")
+async def get_experiment_comparison(experiment_id: str):
+    """获取实验对比分析"""
+    return compare_trials(experiment_id)
+
+
+@app.get("/api/automl/experiments/{experiment_id}/recommendation")
+async def get_experiment_recommendation(experiment_id: str):
+    """获取推荐配置"""
+    return get_recommended_params(experiment_id)
+
+
+@app.delete("/api/automl/experiments/{experiment_id}")
+async def delete_automl_experiment(experiment_id: str):
+    """删除AutoML实验（连带所有trials）"""
+    # 验证实验存在
+    rows = execute_query("SELECT id FROM automl_experiments WHERE id = %s", (experiment_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    
+    # 先删除关联的trials
+    execute_update("DELETE FROM automl_trials WHERE experiment_id = %s", (experiment_id,))
+    
+    # 删除实验
+    execute_update("DELETE FROM automl_experiments WHERE id = %s", (experiment_id,))
+    
+    return {"success": True, "message": "实验及关联参数组已删除"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8004)

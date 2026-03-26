@@ -1,0 +1,12 @@
+[2026-03-25T14:50:52.261834] ML训练开始: classification - random_forest
+
+[ERROR] Cannot perform reduction 'mean' with string dtype
+[2026-03-25T14:51:52.270371] ML训练开始: classification - random_forest
+
+[ERROR] Cannot perform reduction 'mean' with string dtype
+[2026-03-25T14:52:52.278547] ML训练开始: classification - random_forest
+
+[ERROR] Cannot perform reduction 'mean' with string dtype
+[2026-03-25T14:53:52.285543] ML训练开始: classification - random_forest
+
+[ERROR] Cannot perform reduction 'mean' with string dtype
