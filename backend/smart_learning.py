@@ -22,6 +22,169 @@ MODELS_DIR = Path("/var/www/ai-training/models")
 DATA_DIR = Path("/var/www/ai-training/data")
 
 
+class FeishuNotifier:
+    """飞书通知器"""
+    
+    @staticmethod
+    def send_learning_notification(project_id: str, learning_job_id: str, 
+                                   status: str, result: Dict = None):
+        """发送学习结果通知"""
+        try:
+            # 获取飞书Webhook配置
+            rows = execute_query(
+                'SELECT webhook_url FROM feishu_notifications WHERE project_id = %s',
+                (project_id,)
+            )
+            
+            if not rows:
+                logger.info(f"项目 {project_id} 未配置飞书通知")
+                return
+            
+            webhook_url = rows[0]['webhook_url']
+            
+            # 获取项目信息
+            project_rows = execute_query(
+                'SELECT name FROM projects WHERE id = %s',
+                (project_id,)
+            )
+            project_name = project_rows[0]['name'] if project_rows else '未知项目'
+            
+            # 获取学习作业详情
+            job_rows = execute_query(
+                '''SELECT trigger_reason, base_accuracy, new_accuracy, 
+                          accuracy_improvement, deployed, status
+                   FROM scheduled_learning_jobs WHERE id = %s''',
+                (learning_job_id,)
+            )
+            
+            if not job_rows:
+                return
+            
+            job = job_rows[0]
+            
+            # 构建消息
+            if status == 'deployed':
+                title = f"✅ 模型学习完成 - {project_name}"
+                color = "green"
+                content = f"**触发原因**: {job['trigger_reason']}\n"
+                content += f"**基准准确率**: {job['base_accuracy']*100:.2f}%\n" if job['base_accuracy'] else ""
+                content += f"**新准确率**: {job['new_accuracy']*100:.2f}%\n" if job['new_accuracy'] else ""
+                content += f"**改进幅度**: +{job['accuracy_improvement']*100:.2f}%\n" if job['accuracy_improvement'] else ""
+                content += f"**部署状态**: {'✅ 已自动部署' if job['deployed'] else '⏳ 等待确认'}\n"
+            elif status == 'rejected':
+                title = f"⚠️ 模型学习完成但未部署 - {project_name}"
+                color = "orange"
+                content = f"**触发原因**: {job['trigger_reason']}\n"
+                content += f"**改进幅度**: {job['accuracy_improvement']*100:.2f}%\n" if job['accuracy_improvement'] else "未达改进阈值\n"
+                content += "**原因**: 新模型性能未达预期，保留旧版本\n"
+            elif status == 'failed':
+                title = f"❌ 模型学习失败 - {project_name}"
+                color = "red"
+                content = f"**触发原因**: {job['trigger_reason']}\n"
+                content += "**状态**: 学习过程中发生错误，请检查日志\n"
+            else:
+                return
+            
+            # 发送飞书消息
+            import urllib.request
+            
+            message = {
+                "msg_type": "interactive",
+                "card": {
+                    "header": {
+                        "title": {"tag": "plain_text", "content": title},
+                        "template": color
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": content}
+                        },
+                        {
+                            "tag": "action",
+                            "actions": [
+                                {
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "查看详情"},
+                                    "url": f"/ai-training/projects/{project_id}",
+                                    "type": "primary"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+            
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(message).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                logger.info(f"飞书通知发送成功: {learning_job_id}")
+                
+        except Exception as e:
+            logger.error(f"飞书通知发送失败: {e}")
+    
+    @staticmethod
+    def send_trigger_notification(project_id: str, config_id: str, trigger_reason: str):
+        """发送触发通知"""
+        try:
+            rows = execute_query(
+                'SELECT webhook_url FROM feishu_notifications WHERE project_id = %s',
+                (project_id,)
+            )
+            
+            if not rows:
+                return
+            
+            webhook_url = rows[0]['webhook_url']
+            
+            # 获取项目信息
+            project_rows = execute_query(
+                'SELECT name FROM projects WHERE id = %s',
+                (project_id,)
+            )
+            project_name = project_rows[0]['name'] if project_rows else '未知项目'
+            
+            title = f"🚀 智能学习已触发 - {project_name}"
+            content = f"**触发原因**: {trigger_reason}\n"
+            content += "**状态**: 正在准备数据集并启动训练...\n"
+            
+            import urllib.request
+            
+            message = {
+                "msg_type": "interactive",
+                "card": {
+                    "header": {
+                        "title": {"tag": "plain_text", "content": title},
+                        "template": "blue"
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": content}
+                        }
+                    ]
+                }
+            }
+            
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(message).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                logger.info(f"触发通知发送成功: {config_id}")
+                
+        except Exception as e:
+            logger.error(f"触发通知发送失败: {e}")
+
+
 class ModelTypeDetector:
     """模型类型检测器"""
     
@@ -184,7 +347,7 @@ class DatasetVersionManager:
         """加载新数据（从标注任务等）"""
         new_data = []
         
-        # 从标注任务加载
+        # 从标注任务加载（文本分类）
         if include_annotations:
             annotation_rows = execute_query(
                 '''SELECT a.content, a.label 
@@ -200,13 +363,192 @@ class DatasetVersionManager:
                 df = pd.DataFrame(annotation_rows)
                 df.columns = ['text', 'label']
                 new_data.append(df)
-                logger.info(f"从标注加载 {len(df)} 条")
+                logger.info(f"从文本标注加载 {len(df)} 条")
         
-        # TODO: 从其他来源加载新数据
+        # 从图片标注加载（目标检测/图像分类）
+        image_annotation_rows = execute_query(
+            '''SELECT a.image_path, a.objects, t.task_type
+               FROM annotations a
+               JOIN annotation_tasks t ON a.task_id = t.id
+               WHERE t.project_id = %s AND a.status = 'annotated'
+               AND a.updated_at > NOW() - INTERVAL '7 days'
+               ORDER BY a.updated_at DESC''',
+            (project_id,)
+        )
+        
+        if image_annotation_rows:
+            # 对于图像分类，提取主标签
+            img_data = []
+            for row in image_annotation_rows:
+                objects = row['objects']
+                if isinstance(objects, str):
+                    try:
+                        objects = json.loads(objects)
+                    except:
+                        continue
+                if objects and len(objects) > 0:
+                    # 取第一个对象的类别作为标签
+                    label = objects[0].get('class', 'unknown')
+                    img_data.append({
+                        'image_path': row['image_path'],
+                        'label': label
+                    })
+            
+            if img_data:
+                df = pd.DataFrame(img_data)
+                new_data.append(df)
+                logger.info(f"从图片标注加载 {len(df)} 条")
+        
+        # 从最近上传的数据集加载
+        recent_dataset_rows = execute_query(
+            '''SELECT file_path, file_type FROM datasets
+               WHERE project_id = %s AND status = 'uploaded'
+               AND created_at > NOW() - INTERVAL '7 days'
+               ORDER BY created_at DESC
+               LIMIT 5''',
+            (project_id,)
+        )
+        
+        for row in recent_dataset_rows:
+            file_path = row['file_path']
+            if not file_path or not Path(file_path).exists():
+                continue
+            
+            try:
+                if row['file_type'] in ['csv', 'txt']:
+                    df = pd.read_csv(file_path)
+                    new_data.append(df)
+                    logger.info(f"从数据集 {Path(file_path).name} 加载 {len(df)} 条")
+                elif row['file_type'] in ['xlsx', 'xls']:
+                    df = pd.read_excel(file_path)
+                    new_data.append(df)
+                    logger.info(f"从数据集 {Path(file_path).name} 加载 {len(df)} 条")
+            except Exception as e:
+                logger.warning(f"加载数据集失败 {file_path}: {e}")
         
         if new_data:
             return pd.concat(new_data, ignore_index=True)
         return pd.DataFrame()
+    
+    def prepare_image_dataset(self, project_id: str, 
+                              base_dataset_id: str = None) -> Optional[str]:
+        """
+        准备图片数据集（用于图像分类/目标检测）
+        合并历史图片文件夹和新标注的图片
+        
+        Returns: 合并后的数据集路径（文件夹路径）
+        """
+        try:
+            # 1. 获取基础数据集路径
+            base_path = None
+            if base_dataset_id:
+                rows = execute_query(
+                    'SELECT file_path FROM datasets WHERE id = %s AND project_id = %s',
+                    (base_dataset_id, project_id)
+                )
+                if rows and rows[0]['file_path']:
+                    base_path = Path(rows[0]['file_path'])
+            else:
+                # 使用最新的图片数据集
+                rows = execute_query(
+                    '''SELECT file_path FROM datasets 
+                       WHERE project_id = %s 
+                       AND (file_type = 'folder' OR file_path LIKE '%.zip')
+                       ORDER BY created_at DESC LIMIT 1''',
+                    (project_id,)
+                )
+                if rows and rows[0]['file_path']:
+                    base_path = Path(rows[0]['file_path'])
+            
+            # 2. 创建新版本目录
+            version_id = f"img_merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            output_dir = DATA_DIR / project_id / version_id
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 3. 复制基础数据
+            if base_path and base_path.exists():
+                import shutil
+                if base_path.is_dir():
+                    # 复制整个目录结构
+                    for item in base_path.iterdir():
+                        if item.is_dir():
+                            shutil.copytree(item, output_dir / item.name, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(item, output_dir / item.name)
+                    logger.info(f"复制基础图片数据: {base_path} -> {output_dir}")
+            
+            # 4. 添加新标注的图片
+            new_annotations = execute_query(
+                '''SELECT a.image_path, a.objects, t.classes
+                   FROM annotations a
+                   JOIN annotation_tasks t ON a.task_id = t.id
+                   WHERE t.project_id = %s AND a.status = 'annotated'
+                   AND a.updated_at > NOW() - INTERVAL '7 days'
+                   ORDER BY a.updated_at DESC''',
+                (project_id,)
+            )
+            
+            if new_annotations:
+                # 解析类别
+                classes = []
+                if new_annotations[0]['classes']:
+                    try:
+                        classes = json.loads(new_annotations[0]['classes'])
+                    except:
+                        pass
+                
+                # 创建类别目录
+                for cls in classes:
+                    (output_dir / cls).mkdir(exist_ok=True)
+                
+                # 获取基础数据集路径作为源目录
+                if base_path:
+                    for anno in new_annotations:
+                        img_path = anno['image_path']
+                        if not img_path:
+                            continue
+                        
+                        # 解析标注确定类别
+                        objects = anno['objects']
+                        if isinstance(objects, str):
+                            try:
+                                objects = json.loads(objects)
+                            except:
+                                continue
+                        
+                        if objects and len(objects) > 0:
+                            label = objects[0].get('class', 'unknown')
+                            if label in classes:
+                                # 复制图片到对应类别目录
+                                src = base_path / img_path if base_path else Path(img_path)
+                                dst = output_dir / label / Path(img_path).name
+                                if src.exists():
+                                    shutil.copy2(src, dst)
+                    
+                    logger.info(f"添加了 {len(new_annotations)} 张新标注图片")
+            
+            # 5. 创建数据索引文件
+            image_list = []
+            for class_dir in output_dir.iterdir():
+                if class_dir.is_dir():
+                    for img_file in class_dir.iterdir():
+                        if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+                            image_list.append({
+                                'image_path': str(img_file.relative_to(output_dir)),
+                                'label': class_dir.name
+                            })
+            
+            if image_list:
+                df = pd.DataFrame(image_list)
+                df.to_csv(output_dir / 'index.csv', index=False)
+                logger.info(f"图片数据集准备完成: {output_dir} ({len(image_list)} 张)")
+                return str(output_dir)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"准备图片数据集失败: {e}")
+            return None
 
 
 class SmartLearningScheduler:
@@ -423,9 +765,24 @@ class SmartLearningScheduler:
             WHERE id = %s
         ''', (config_id,))
         
+        # 发送触发通知
+        FeishuNotifier.send_trigger_notification(
+            config['project_id'], config_id, reason
+        )
+        
         if learning_mode == 'incremental':
             # 使用原有的增量学习
-            return self._run_incremental_learning(job_id, config, dataset_id)
+            result = self._run_incremental_learning(job_id, config, dataset_id)
+            # 发送结果通知
+            if result.get('success'):
+                FeishuNotifier.send_learning_notification(
+                    config['project_id'], job_id, 'deployed', result
+                )
+            else:
+                FeishuNotifier.send_learning_notification(
+                    config['project_id'], job_id, 'failed', result
+                )
+            return result
         else:
             # 使用定时全量重训练
             return self._run_scheduled_retrain(job_id, config, dataset_id)
@@ -591,6 +948,18 @@ class SmartLearningScheduler:
         ''', ('deployed' if should_deploy else 'rejected', new_job_id,
               base_acc, new_acc, improvement,
               should_deploy, should_deploy, learning_job_id))
+        
+        # 发送通知
+        status = 'deployed' if should_deploy else 'rejected'
+        FeishuNotifier.send_learning_notification(
+            job['project_id'], learning_job_id, status,
+            {
+                'base_accuracy': base_acc,
+                'new_accuracy': new_acc,
+                'accuracy_improvement': improvement,
+                'deployed': should_deploy
+            }
+        )
         
         if should_deploy:
             # 更新成功计数

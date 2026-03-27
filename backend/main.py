@@ -2295,6 +2295,18 @@ async def startup_event():
     """应用启动时初始化"""
     scheduler.start()
     reload_scheduler()
+    
+    # 添加智能学习定时检查（每分钟）
+    from smart_learning import check_all_scheduled_learning
+    scheduler.add_job(
+        check_all_scheduled_learning,
+        'interval',
+        minutes=1,
+        id='smart_learning_checker',
+        replace_existing=True
+    )
+    logger.info("智能学习定时检查已启动（每分钟）")
+    
     logger.info("定时任务调度器已启动")
 
 
