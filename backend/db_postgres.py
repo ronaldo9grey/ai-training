@@ -221,7 +221,7 @@ def init_database_tables():
     
     -- 在线学习任务表
     CREATE TABLE IF NOT EXISTS online_learning_tasks (
-        id VARCHAR(64) PRIMARY KEY,
+        id VARCHAR(128) PRIMARY KEY,
         project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
         base_job_id VARCHAR(64) REFERENCES training_jobs(id) ON DELETE SET NULL,
         learning_type VARCHAR(50),
@@ -235,6 +235,123 @@ def init_database_tables():
         completed_at TIMESTAMP
     );
     
+    -- 推理调用日志表
+    CREATE TABLE IF NOT EXISTS inference_logs (
+        id SERIAL PRIMARY KEY,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        job_id VARCHAR(64) REFERENCES training_jobs(id) ON DELETE SET NULL,
+        model_id VARCHAR(255),
+        input_data JSONB,
+        output_data JSONB,
+        latency_ms INTEGER,
+        success BOOLEAN DEFAULT TRUE,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 自动学习配置表 (原有sklearn增量学习用)
+    CREATE TABLE IF NOT EXISTS auto_learning_config (
+        id VARCHAR(128) PRIMARY KEY,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        job_id VARCHAR(64) REFERENCES training_jobs(id) ON DELETE CASCADE,
+        schedule VARCHAR(50) NOT NULL, -- 'daily', 'weekly', 'never'
+        min_samples INTEGER DEFAULT 100,
+        accuracy_threshold FLOAT DEFAULT 0.05,
+        is_active BOOLEAN DEFAULT TRUE,
+        last_trigger_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 智能学习配置表（统一配置，支持所有模型类型）
+    CREATE TABLE IF NOT EXISTS smart_learning_config (
+        id VARCHAR(128) PRIMARY KEY,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        job_id VARCHAR(64) REFERENCES training_jobs(id) ON DELETE CASCADE,
+        model_type VARCHAR(50) NOT NULL, -- 'sklearn', 'pytorch', 'transformers', 'unknown'
+        learning_mode VARCHAR(50) NOT NULL, -- 'incremental', 'scheduled_retrain'
+        
+        -- 触发配置
+        trigger_schedule VARCHAR(50), -- 'daily', 'weekly', 'monthly', 'never'
+        trigger_min_samples INTEGER DEFAULT 100,
+        trigger_performance_drop FLOAT DEFAULT 0.05,
+        
+        -- 执行配置
+        auto_deploy BOOLEAN DEFAULT FALSE,
+        min_improvement FLOAT DEFAULT 0.0,
+        use_latest_dataset BOOLEAN DEFAULT TRUE,
+        
+        -- 状态
+        is_active BOOLEAN DEFAULT TRUE,
+        last_trigger_at TIMESTAMP,
+        last_success_at TIMESTAMP,
+        trigger_count INTEGER DEFAULT 0,
+        success_count INTEGER DEFAULT 0,
+        
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 定时学习执行历史表（深度学习模型）
+    CREATE TABLE IF NOT EXISTS scheduled_learning_jobs (
+        id VARCHAR(128) PRIMARY KEY,
+        config_id VARCHAR(128) REFERENCES smart_learning_config(id) ON DELETE CASCADE,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        base_job_id VARCHAR(64) REFERENCES training_jobs(id) ON DELETE SET NULL,
+        new_job_id VARCHAR(64) REFERENCES training_jobs(id) ON DELETE SET NULL,
+        
+        -- 执行信息
+        trigger_reason VARCHAR(50), -- 'schedule', 'data_volume', 'performance_drop', 'manual'
+        status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'training', 'comparing', 'deployed', 'rejected', 'failed'
+        
+        -- 性能对比
+        base_accuracy FLOAT,
+        new_accuracy FLOAT,
+        accuracy_improvement FLOAT,
+        base_latency_ms INTEGER,
+        new_latency_ms INTEGER,
+        
+        -- 部署信息
+        deployed BOOLEAN DEFAULT FALSE,
+        deployed_at TIMESTAMP,
+        
+        -- 日志
+        log_message TEXT,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP
+    );
+
+    -- 推理服务告警规则表
+    CREATE TABLE IF NOT EXISTS inference_alert_rules (
+        id VARCHAR(64) PRIMARY KEY,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        rule_type VARCHAR(50) NOT NULL, -- 'error_rate', 'latency', 'memory', 'service_down'
+        threshold_value FLOAT NOT NULL,
+        time_window_minutes INTEGER DEFAULT 5,
+        enabled BOOLEAN DEFAULT TRUE,
+        notify_channels JSONB DEFAULT '["web"]',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 推理服务告警记录表
+    CREATE TABLE IF NOT EXISTS inference_alerts (
+        id SERIAL PRIMARY KEY,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        rule_id VARCHAR(64) REFERENCES inference_alert_rules(id) ON DELETE SET NULL,
+        alert_type VARCHAR(50) NOT NULL,
+        severity VARCHAR(20) NOT NULL, -- 'warning', 'critical'
+        title VARCHAR(255) NOT NULL,
+        message TEXT,
+        metric_value FLOAT,
+        threshold_value FLOAT,
+        status VARCHAR(20) DEFAULT 'active', -- 'active', 'acknowledged', 'resolved'
+        acknowledged_by VARCHAR(255),
+        acknowledged_at TIMESTAMP,
+        resolved_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
     -- 创建索引优化查询
     CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at);
     CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id);
@@ -242,6 +359,20 @@ def init_database_tables():
     CREATE INDEX IF NOT EXISTS idx_training_jobs_status ON training_jobs(status);
     CREATE INDEX IF NOT EXISTS idx_training_metrics_job_id ON training_metrics(job_id);
     CREATE INDEX IF NOT EXISTS idx_training_metrics_created_at ON training_metrics(created_at);
+    CREATE INDEX IF NOT EXISTS idx_inference_logs_project_id ON inference_logs(project_id);
+    CREATE INDEX IF NOT EXISTS idx_inference_logs_job_id ON inference_logs(job_id);
+    CREATE INDEX IF NOT EXISTS idx_inference_logs_created_at ON inference_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_inference_alert_rules_project_id ON inference_alert_rules(project_id);
+    CREATE INDEX IF NOT EXISTS idx_inference_alerts_project_id ON inference_alerts(project_id);
+    CREATE INDEX IF NOT EXISTS idx_inference_alerts_status ON inference_alerts(status);
+    CREATE INDEX IF NOT EXISTS idx_inference_alerts_created_at ON inference_alerts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_online_learning_tasks_project_id ON online_learning_tasks(project_id);
+    CREATE INDEX IF NOT EXISTS idx_online_learning_tasks_base_job_id ON online_learning_tasks(base_job_id);
+    CREATE INDEX IF NOT EXISTS idx_auto_learning_config_project_id ON auto_learning_config(project_id);
+    CREATE INDEX IF NOT EXISTS idx_smart_learning_config_project ON smart_learning_config(project_id);
+    CREATE INDEX IF NOT EXISTS idx_smart_learning_config_job ON smart_learning_config(job_id);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_learning_jobs_config ON scheduled_learning_jobs(config_id);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_learning_jobs_status ON scheduled_learning_jobs(status);
     """
     
     with get_db_cursor(commit=True) as cursor:

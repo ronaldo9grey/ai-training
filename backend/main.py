@@ -815,6 +815,9 @@ async def inference_predict(project_id: str, job_id: str, text: str = Form(...))
     - 无需重复加载模型
     - 支持高并发
     """
+    import time
+    start_time = time.time()
+    
     model_id = f"{project_id}/{job_id}"
     
     # 检查模型是否已加载
@@ -842,13 +845,30 @@ async def inference_predict(project_id: str, job_id: str, text: str = Form(...))
     # 执行预测
     try:
         result = inference_service.predict_single(text, model_id)
+        latency_ms = int((time.time() - start_time) * 1000)
+        
+        # 记录推理日志
+        execute_update('''
+            INSERT INTO inference_logs (project_id, job_id, model_id, input_data, output_data, latency_ms, success)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (project_id, job_id, model_id, json.dumps({"text": text}), json.dumps(result), latency_ms, True))
+        
         return {
             "success": True,
             "model_id": model_id,
             "result": result,
+            "latency_ms": latency_ms,
             "device": str(inference_service.device)
         }
     except Exception as e:
+        latency_ms = int((time.time() - start_time) * 1000)
+        
+        # 记录错误日志
+        execute_update('''
+            INSERT INTO inference_logs (project_id, job_id, model_id, input_data, error_message, latency_ms, success)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (project_id, job_id, model_id, json.dumps({"text": text}), str(e), latency_ms, False))
+        
         raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
 
 
@@ -1380,6 +1400,527 @@ async def cleanup_memory(keep_models: List[str] = None):
         "memory_after": f"{status_after['memory_percent']:.1f}%",
         "memory_freed_gb": status_before['memory_used_gb'] - status_after['memory_used_gb']
     }
+
+
+@app.post("/api/inference/unload")
+async def unload_model_api(request: Dict):
+    """卸载指定模型"""
+    model_id = request.get('model_id')
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    
+    inference_service.unload_model(model_id)
+    return {"success": True, "message": f"模型 {model_id} 已卸载"}
+
+
+@app.post("/api/projects/{project_id}/jobs/{job_id}/load")
+async def load_model_for_inference(project_id: str, job_id: str):
+    """加载模型到内存用于推理"""
+    # 获取任务信息
+    rows = execute_query('''
+        SELECT model_path, model_name, status, model_type FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    row = rows[0]
+    model_path = row['model_path']
+    status = row['status']
+    model_type = row.get('model_type', 'nlp')  # 默认为nlp
+    
+    if status != 'completed':
+        raise HTTPException(status_code=400, detail="训练尚未完成")
+    
+    # 加载模型到推理服务
+    try:
+        model_id = f"{project_id}/{job_id}"
+        inference_service.load_model(model_path, model_id, model_type)
+        return {"success": True, "message": "模型已加载到内存", "model_id": model_id}
+    except Exception as e:
+        logger.error(f"加载模型失败: {e}")
+        raise HTTPException(status_code=500, detail=f"加载模型失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_id}/inference/stats")
+async def get_inference_stats(project_id: str):
+    """获取项目推理统计信息"""
+    # 从推理日志中获取统计
+    rows = execute_query('''
+        SELECT COUNT(*) as total_calls,
+               AVG(CASE WHEN success THEN latency_ms ELSE NULL END) as avg_latency_ms,
+               SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count,
+               SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as error_count
+        FROM inference_logs 
+        WHERE project_id = %s
+    ''', (project_id,))
+    
+    stats = rows[0] if rows else {}
+    total_calls = stats.get('total_calls', 0) or 0
+    success_count = stats.get('success_count', 0) or 0
+    error_count = stats.get('error_count', 0) or 0
+    
+    # 计算成功率
+    success_rate = round((success_count / total_calls * 100), 2) if total_calls > 0 else 100
+    
+    # 获取已加载模型数
+    loaded_models = inference_service.list_loaded_models()
+    project_models = [m for m in loaded_models if m['model_id'].startswith(f"{project_id}/")]
+    
+    return {
+        "totalCalls": total_calls,
+        "avgLatency": round(stats.get('avg_latency_ms', 0) or 0, 2),
+        "successRate": success_rate,
+        "errorCount": error_count,
+        "loadedModels": len(project_models)
+    }
+
+
+@app.get("/api/projects/{project_id}/inference/trends")
+async def get_inference_trends(project_id: str, hours: int = 24):
+    """获取推理调用趋势（按小时）"""
+    rows = execute_query('''
+        SELECT 
+            date_trunc('hour', created_at) as hour,
+            COUNT(*) as call_count,
+            AVG(CASE WHEN success THEN latency_ms ELSE NULL END) as avg_latency,
+            SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count,
+            SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as error_count
+        FROM inference_logs 
+        WHERE project_id = %s 
+          AND created_at >= NOW() - INTERVAL '%s hours'
+        GROUP BY date_trunc('hour', created_at)
+        ORDER BY hour DESC
+        LIMIT %s
+    ''', (project_id, hours, hours))
+    
+    trends = []
+    for row in rows:
+        trends.append({
+            "hour": row['hour'].isoformat() if row['hour'] else None,
+            "callCount": row['call_count'],
+            "avgLatency": round(row['avg_latency'] or 0, 2),
+            "successCount": row['success_count'],
+            "errorCount": row['error_count']
+        })
+    
+    return {"trends": trends, "hours": hours}
+
+
+@app.get("/api/projects/{project_id}/inference/latency-distribution")
+async def get_latency_distribution(project_id: str):
+    """获取延迟分布统计"""
+    rows = execute_query('''
+        SELECT 
+            CASE 
+                WHEN latency_ms < 50 THEN '0-50ms'
+                WHEN latency_ms < 100 THEN '50-100ms'
+                WHEN latency_ms < 200 THEN '100-200ms'
+                WHEN latency_ms < 500 THEN '200-500ms'
+                WHEN latency_ms < 1000 THEN '500ms-1s'
+                ELSE '>1s'
+            END as latency_range,
+            COUNT(*) as count
+        FROM inference_logs 
+        WHERE project_id = %s AND success = TRUE
+        GROUP BY 
+            CASE 
+                WHEN latency_ms < 50 THEN '0-50ms'
+                WHEN latency_ms < 100 THEN '50-100ms'
+                WHEN latency_ms < 200 THEN '100-200ms'
+                WHEN latency_ms < 500 THEN '200-500ms'
+                WHEN latency_ms < 1000 THEN '500ms-1s'
+                ELSE '>1s'
+            END
+        ORDER BY count DESC
+    ''', (project_id,))
+    
+    distribution = []
+    for row in rows:
+        distribution.append({
+            "range": row['latency_range'],
+            "count": row['count']
+        })
+    
+    return {"distribution": distribution}
+
+
+@app.get("/api/projects/{project_id}/inference/recent-logs")
+async def get_recent_inference_logs(project_id: str, limit: int = 50):
+    """获取最近的推理日志"""
+    rows = execute_query('''
+        SELECT 
+            il.id,
+            il.model_id,
+            il.latency_ms,
+            il.success,
+            il.error_message,
+            il.created_at,
+            tj.model_name
+        FROM inference_logs il
+        LEFT JOIN training_jobs tj ON il.job_id = tj.id
+        WHERE il.project_id = %s
+        ORDER BY il.created_at DESC
+        LIMIT %s
+    ''', (project_id, limit))
+    
+    logs = []
+    for row in rows:
+        logs.append({
+            "id": row['id'],
+            "modelId": row['model_id'],
+            "modelName": row['model_name'] or 'Unknown',
+            "latencyMs": row['latency_ms'],
+            "success": row['success'],
+            "errorMessage": row['error_message'],
+            "createdAt": row['created_at'].isoformat() if row['created_at'] else None
+        })
+    
+    return {"logs": logs}
+
+
+# ============ 推理服务告警API ============
+
+@app.get("/api/projects/{project_id}/inference/alert-rules")
+async def get_inference_alert_rules(project_id: str):
+    """获取推理服务告警规则"""
+    rows = execute_query('''
+        SELECT id, name, rule_type, threshold_value, time_window_minutes, enabled, notify_channels
+        FROM inference_alert_rules
+        WHERE project_id = %s
+        ORDER BY created_at DESC
+    ''', (project_id,))
+    
+    rules = []
+    for row in rows:
+        rules.append({
+            "id": row['id'],
+            "name": row['name'],
+            "ruleType": row['rule_type'],
+            "thresholdValue": row['threshold_value'],
+            "timeWindowMinutes": row['time_window_minutes'],
+            "enabled": row['enabled'],
+            "notifyChannels": row['notify_channels']
+        })
+    
+    return {"rules": rules}
+
+
+@app.post("/api/projects/{project_id}/inference/alert-rules")
+async def create_inference_alert_rule(
+    project_id: str,
+    name: str = Form(...),
+    rule_type: str = Form(...),
+    threshold_value: float = Form(...),
+    time_window_minutes: int = Form(5),
+    notify_channels: str = Form('["web"]')
+):
+    """创建推理服务告警规则"""
+    rule_id = str(uuid.uuid4())
+    
+    execute_update('''
+        INSERT INTO inference_alert_rules 
+        (id, project_id, name, rule_type, threshold_value, time_window_minutes, notify_channels)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ''', (rule_id, project_id, name, rule_type, threshold_value, time_window_minutes, notify_channels))
+    
+    return {"success": True, "id": rule_id, "message": "告警规则已创建"}
+
+
+@app.delete("/api/projects/{project_id}/inference/alert-rules/{rule_id}")
+async def delete_inference_alert_rule(project_id: str, rule_id: str):
+    """删除推理服务告警规则"""
+    execute_update('''
+        DELETE FROM inference_alert_rules 
+        WHERE id = %s AND project_id = %s
+    ''', (rule_id, project_id))
+    
+    return {"success": True, "message": "告警规则已删除"}
+
+
+@app.post("/api/projects/{project_id}/inference/alert-rules/{rule_id}/toggle")
+async def toggle_inference_alert_rule(project_id: str, rule_id: str):
+    """启用/禁用告警规则"""
+    execute_update('''
+        UPDATE inference_alert_rules 
+        SET enabled = NOT enabled
+        WHERE id = %s AND project_id = %s
+    ''', (rule_id, project_id))
+    
+    return {"success": True, "message": "告警规则状态已更新"}
+
+
+@app.get("/api/projects/{project_id}/inference/alerts")
+async def get_inference_alerts(project_id: str, status: str = None, limit: int = 50):
+    """获取推理服务告警记录"""
+    if status:
+        rows = execute_query('''
+            SELECT id, alert_type, severity, title, message, metric_value, threshold_value,
+                   status, acknowledged_by, acknowledged_at, resolved_at, created_at
+            FROM inference_alerts
+            WHERE project_id = %s AND status = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        ''', (project_id, status, limit))
+    else:
+        rows = execute_query('''
+            SELECT id, alert_type, severity, title, message, metric_value, threshold_value,
+                   status, acknowledged_by, acknowledged_at, resolved_at, created_at
+            FROM inference_alerts
+            WHERE project_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        ''', (project_id, limit))
+    
+    alerts = []
+    for row in rows:
+        alerts.append({
+            "id": row['id'],
+            "alertType": row['alert_type'],
+            "severity": row['severity'],
+            "title": row['title'],
+            "message": row['message'],
+            "metricValue": row['metric_value'],
+            "thresholdValue": row['threshold_value'],
+            "status": row['status'],
+            "acknowledgedBy": row['acknowledged_by'],
+            "acknowledgedAt": row['acknowledged_at'].isoformat() if row['acknowledged_at'] else None,
+            "resolvedAt": row['resolved_at'].isoformat() if row['resolved_at'] else None,
+            "createdAt": row['created_at'].isoformat() if row['created_at'] else None
+        })
+    
+    return {"alerts": alerts}
+
+
+@app.post("/api/inference/alerts/{alert_id}/acknowledge")
+async def acknowledge_inference_alert(alert_id: int, user: str = Form("admin")):
+    """确认告警"""
+    execute_update('''
+        UPDATE inference_alerts 
+        SET status = 'acknowledged', acknowledged_by = %s, acknowledged_at = NOW()
+        WHERE id = %s
+    ''', (user, alert_id))
+    
+    return {"success": True, "message": "告警已确认"}
+
+
+@app.post("/api/inference/alerts/{alert_id}/resolve")
+async def resolve_inference_alert(alert_id: int):
+    """解决告警"""
+    execute_update('''
+        UPDATE inference_alerts 
+        SET status = 'resolved', resolved_at = NOW()
+        WHERE id = %s
+    ''', (alert_id,))
+    
+    return {"success": True, "message": "告警已解决"}
+
+
+@app.post("/api/projects/{project_id}/inference/check-alerts")
+async def check_inference_alerts(project_id: str):
+    """
+    检查推理服务告警条件
+    根据配置的规则检查最近的推理日志，触发告警
+    """
+    # 获取启用的告警规则
+    rules = execute_query('''
+        SELECT id, name, rule_type, threshold_value, time_window_minutes
+        FROM inference_alert_rules
+        WHERE project_id = %s AND enabled = TRUE
+    ''', (project_id,))
+    
+    triggered_alerts = []
+    
+    for rule in rules:
+        rule_id = rule['id']
+        rule_type = rule['rule_type']
+        threshold = rule['threshold_value']
+        window_minutes = rule['time_window_minutes']
+        
+        # 检查是否已有未解决的相同类型告警
+        existing_alert = execute_query('''
+            SELECT id FROM inference_alerts
+            WHERE project_id = %s AND rule_id = %s AND status = 'active'
+        ''', (project_id, rule_id))
+        
+        if existing_alert:
+            continue  # 已有活跃告警，跳过
+        
+        # 根据规则类型检查
+        if rule_type == 'error_rate':
+            # 检查错误率
+            stats = execute_query('''
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as errors
+                FROM inference_logs
+                WHERE project_id = %s AND created_at >= NOW() - INTERVAL '%s minutes'
+            ''', (project_id, window_minutes))
+            
+            if stats and stats[0]['total'] > 0:
+                error_rate = (stats[0]['errors'] / stats[0]['total']) * 100
+                if error_rate >= threshold:
+                    alert_id = execute_inference_alert(
+                        project_id, rule_id, 'error_rate', 'critical',
+                        f"推理错误率过高: {error_rate:.1f}%",
+                        f"最近{window_minutes}分钟内错误率达到{error_rate:.1f}%，超过阈值{threshold}%",
+                        error_rate, threshold
+                    )
+                    triggered_alerts.append({"type": "error_rate", "value": error_rate})
+        
+        elif rule_type == 'latency':
+            # 检查平均延迟
+            stats = execute_query('''
+                SELECT AVG(latency_ms) as avg_latency
+                FROM inference_logs
+                WHERE project_id = %s AND success = TRUE
+                  AND created_at >= NOW() - INTERVAL '%s minutes'
+            ''', (project_id, window_minutes))
+            
+            if stats and stats[0]['avg_latency']:
+                avg_latency = stats[0]['avg_latency']
+                if avg_latency >= threshold:
+                    alert_id = execute_inference_alert(
+                        project_id, rule_id, 'latency', 'warning',
+                        f"推理延迟过高: {avg_latency:.0f}ms",
+                        f"最近{window_minutes}分钟内平均延迟达到{avg_latency:.0f}ms，超过阈值{threshold}ms",
+                        avg_latency, threshold
+                    )
+                    triggered_alerts.append({"type": "latency", "value": avg_latency})
+        
+        elif rule_type == 'memory':
+            # 检查内存使用率
+            memory_status = inference_service.get_memory_status()
+            memory_percent = memory_status['memory_percent']
+            
+            if memory_percent >= threshold:
+                alert_id = execute_inference_alert(
+                    project_id, rule_id, 'memory', 'critical' if memory_percent > 90 else 'warning',
+                    f"系统内存使用率过高: {memory_percent:.1f}%",
+                    f"当前内存使用率{memory_percent:.1f}%，超过阈值{threshold}%",
+                    memory_percent, threshold
+                )
+                triggered_alerts.append({"type": "memory", "value": memory_percent})
+    
+    return {
+        "success": True,
+        "checked_rules": len(rules),
+        "triggered_alerts": triggered_alerts
+    }
+
+
+def execute_inference_alert(project_id: str, rule_id: str, alert_type: str, severity: str,
+                            title: str, message: str, metric_value: float, threshold_value: float):
+    """执行告警：写入数据库并发送通知"""
+    # 写入告警记录
+    rows = execute_query('''
+        INSERT INTO inference_alerts 
+        (project_id, rule_id, alert_type, severity, title, message, metric_value, threshold_value)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    ''', (project_id, rule_id, alert_type, severity, title, message, metric_value, threshold_value))
+    
+    alert_id = rows[0]['id'] if rows else None
+    
+    # TODO: 发送飞书通知（如果需要）
+    
+    return alert_id
+
+
+@app.get("/api/projects/{project_id}/inference/recommendations")
+async def get_inference_recommendations(project_id: str):
+    """
+    获取推理服务优化建议
+    基于历史数据分析给出运营优化建议
+    """
+    recommendations = []
+    
+    # 1. 检查模型冷热情况
+    hot_models = execute_query('''
+        SELECT model_id, COUNT(*) as call_count
+        FROM inference_logs
+        WHERE project_id = %s AND created_at >= NOW() - INTERVAL '1 hour'
+        GROUP BY model_id
+        ORDER BY call_count DESC
+        LIMIT 5
+    ''', (project_id,))
+    
+    if hot_models:
+        top_model = hot_models[0]
+        if top_model['call_count'] > 100:
+            recommendations.append({
+                "type": "hot_model",
+                "priority": "high",
+                "title": "热点模型建议常驻内存",
+                "description": f"模型 {top_model['model_id']} 最近1小时被调用{top_model['call_count']}次，建议保持加载状态以优化响应时间",
+                "action": "保持加载"
+            })
+    
+    # 2. 检查冷模型（已加载但很少使用）
+    loaded_models = inference_service.list_loaded_models()
+    for model in loaded_models:
+        model_id = model['model_id']
+        if not model_id.startswith(f"{project_id}/"):
+            continue
+        
+        recent_calls = execute_query('''
+            SELECT COUNT(*) as count
+            FROM inference_logs
+            WHERE project_id = %s AND model_id = %s
+              AND created_at >= NOW() - INTERVAL '30 minutes'
+        ''', (project_id, model_id))
+        
+        if recent_calls and recent_calls[0]['count'] == 0:
+            recommendations.append({
+                "type": "cold_model",
+                "priority": "medium",
+                "title": "冷模型建议卸载",
+                "description": f"模型 {model_id} 已加载但30分钟内无调用，建议手动卸载释放内存",
+                "action": "卸载模型"
+            })
+    
+    # 3. 延迟优化建议
+    latency_stats = execute_query('''
+        SELECT AVG(latency_ms) as avg_latency, COUNT(*) as count
+        FROM inference_logs
+        WHERE project_id = %s AND success = TRUE
+          AND created_at >= NOW() - INTERVAL '1 hour'
+    ''', (project_id,))
+    
+    if latency_stats and latency_stats[0]['avg_latency']:
+        avg_latency = latency_stats[0]['avg_latency']
+        if avg_latency > 500:
+            recommendations.append({
+                "type": "latency",
+                "priority": "high",
+                "title": "推理延迟较高",
+                "description": f"最近1小时平均延迟{avg_latency:.0f}ms，建议检查模型大小或升级硬件",
+                "action": "优化模型"
+            })
+    
+    # 4. 错误率建议
+    error_stats = execute_query('''
+        SELECT 
+            SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count,
+            SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as error_count
+        FROM inference_logs
+        WHERE project_id = %s AND created_at >= NOW() - INTERVAL '1 hour'
+    ''', (project_id,))
+    
+    if error_stats:
+        total = (error_stats[0]['success_count'] or 0) + (error_stats[0]['error_count'] or 0)
+        errors = error_stats[0]['error_count'] or 0
+        if total > 0 and errors / total > 0.05:
+            recommendations.append({
+                "type": "error_rate",
+                "priority": "critical",
+                "title": "错误率过高需要关注",
+                "description": f"最近1小时错误率达到{errors/total*100:.1f}%，建议检查模型状态或输入数据格式",
+                "action": "检查日志"
+            })
+    
+    return {"recommendations": recommendations}
 
 
 # ============ 飞书通知配置API ============
@@ -2037,6 +2578,121 @@ async def get_auto_learning_config(project_id: str):
             "is_active": bool(row['is_active'])
         })
     return {"configs": configs}
+
+
+# ============ 智能学习 API (新增) ============
+
+@app.post("/api/projects/{project_id}/models/{job_id}/smart-learning")
+async def create_smart_learning_config(
+    project_id: str,
+    job_id: str,
+    trigger_schedule: str = Form("weekly"),
+    trigger_min_samples: int = Form(100),
+    trigger_performance_drop: float = Form(0.05),
+    auto_deploy: bool = Form(False),
+    min_improvement: float = Form(0.0)
+):
+    """
+    创建智能学习配置
+    自动检测模型类型，选择合适的策略
+    sklearn模型 -> 增量学习
+    PyTorch/Transformers -> 定时全量重训练
+    """
+    from smart_learning import SmartLearningScheduler
+    
+    scheduler = SmartLearningScheduler()
+    
+    result = scheduler.create_config(
+        project_id=project_id,
+        job_id=job_id,
+        trigger_schedule=trigger_schedule,
+        trigger_min_samples=trigger_min_samples,
+        trigger_performance_drop=trigger_performance_drop,
+        auto_deploy=auto_deploy,
+        min_improvement=min_improvement
+    )
+    
+    if result.get('success'):
+        return result
+    else:
+        raise HTTPException(status_code=400, detail=result.get('error', '创建失败'))
+
+
+@app.get("/api/projects/{project_id}/models/{job_id}/smart-learning")
+async def get_smart_learning_config(project_id: str, job_id: str):
+    """获取智能学习配置"""
+    from smart_learning import SmartLearningScheduler
+    
+    scheduler = SmartLearningScheduler()
+    config = scheduler.get_config(project_id, job_id)
+    
+    if config:
+        return {"config": config}
+    else:
+        return {"config": None, "message": "未找到配置"}
+
+
+@app.post("/api/projects/{project_id}/models/{job_id}/trigger-learning")
+async def trigger_smart_learning(
+    project_id: str,
+    job_id: str,
+    dataset_id: Optional[str] = Form(None),
+    reason: str = Form("manual")
+):
+    """手动触发智能学习"""
+    from smart_learning import SmartLearningScheduler
+    
+    scheduler = SmartLearningScheduler()
+    
+    # 获取配置
+    config = scheduler.get_config(project_id, job_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="未找到学习配置")
+    
+    # 触发学习
+    result = scheduler.trigger_learning(config['id'], reason, dataset_id)
+    
+    if result.get('success'):
+        return result
+    else:
+        raise HTTPException(status_code=500, detail=result.get('error', '触发失败'))
+
+
+@app.post("/api/projects/{project_id}/models/compare-and-deploy")
+async def compare_and_deploy_model(
+    project_id: str,
+    learning_job_id: str = Form(...),
+    new_job_id: str = Form(...),
+    auto_deploy: bool = Form(False),
+    min_improvement: float = Form(0.0)
+):
+    """对比新旧模型并决定是否部署"""
+    from smart_learning import SmartLearningScheduler
+    
+    scheduler = SmartLearningScheduler()
+    
+    result = scheduler.compare_and_deploy(
+        learning_job_id=learning_job_id,
+        new_job_id=new_job_id,
+        auto_deploy=auto_deploy,
+        min_improvement=min_improvement
+    )
+    
+    if result.get('success'):
+        return result
+    else:
+        raise HTTPException(status_code=400, detail=result.get('error', '对比失败'))
+
+
+@app.get("/api/projects/{project_id}/models/{job_id}/unified-learning-history")
+async def get_unified_learning_history(project_id: str, job_id: str):
+    """获取统一的学习历史（包含增量学习和定时学习）"""
+    from smart_learning import SmartLearningScheduler
+    
+    scheduler = SmartLearningScheduler()
+    history = scheduler.get_learning_history(project_id, job_id)
+    
+    return {"history": history, "count": len(history)}
 
 
 # ============ DeepSeek 根因分析 API ============

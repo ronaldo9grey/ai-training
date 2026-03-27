@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 模型在线学习模块 - 支持增量学习和持续优化
+(已迁移到 PostgreSQL)
 """
 
 import os
 import json
 import logging
-import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -15,24 +15,21 @@ import pandas as pd
 import joblib
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
+# 导入 PostgreSQL 数据库模块
+from db_postgres import execute_query, execute_update
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("/var/www/ai-training/training.db")
 MODELS_DIR = Path("/var/www/ai-training/models")
 
 
 class OnlineLearningManager:
-    """在线学习管理器"""
+    """在线学习管理器 - PostgreSQL 版本"""
     
     def __init__(self):
-        self.db_path = DB_PATH
         self.models_dir = MODELS_DIR
         
-    def _get_db_connection(self):
-        """获取数据库连接"""
-        return sqlite3.connect(self.db_path)
-    
     def create_learning_task(self, project_id: str, job_id: str, 
                             learning_type: str = 'incremental',
                             strategy: Dict = None) -> str:
@@ -50,39 +47,12 @@ class OnlineLearningManager:
         """
         task_id = f"ol_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{job_id[:8]}"
         
-        conn = self._get_db_connection()
-        cursor = conn.cursor()
-        
-        # 创建在线学习表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS online_learning_tasks (
-                id TEXT PRIMARY KEY,
-                project_id TEXT,
-                base_job_id TEXT,
-                learning_type TEXT,
-                strategy TEXT,
-                status TEXT DEFAULT 'pending',
-                new_samples_count INTEGER DEFAULT 0,
-                accuracy_before REAL,
-                accuracy_after REAL,
-                model_path TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP,
-                FOREIGN KEY (project_id) REFERENCES projects(id),
-                FOREIGN KEY (base_job_id) REFERENCES training_jobs(id)
-            )
-        ''')
-        
-        # 插入任务
-        cursor.execute('''
+        execute_update('''
             INSERT INTO online_learning_tasks 
             (id, project_id, base_job_id, learning_type, strategy, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         ''', (task_id, project_id, job_id, learning_type, 
               json.dumps(strategy or {}), 'pending'))
-        
-        conn.commit()
-        conn.close()
         
         logger.info(f"创建在线学习任务: {task_id}")
         return task_id
@@ -97,39 +67,33 @@ class OnlineLearningManager:
         3. 评估新旧模型性能
         4. 如果新模型更好，替换；否则保留旧模型
         """
-        conn = self._get_db_connection()
-        cursor = conn.cursor()
-        
         # 获取任务信息
-        cursor.execute('''
+        rows = execute_query('''
             SELECT base_job_id, project_id, strategy 
-            FROM online_learning_tasks WHERE id = ?
+            FROM online_learning_tasks WHERE id = %s
         ''', (task_id,))
         
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
+        if not rows:
             raise ValueError(f"学习任务不存在: {task_id}")
         
-        base_job_id, project_id, strategy = row
-        strategy = json.loads(strategy) if strategy else {}
+        row = rows[0]
+        base_job_id = row['base_job_id']
+        project_id = row['project_id']
+        strategy = json.loads(row['strategy']) if row['strategy'] else {}
         
         # 获取原模型路径
-        cursor.execute('SELECT model_path FROM training_jobs WHERE id = ?', (base_job_id,))
-        model_row = cursor.fetchone()
-        if not model_row:
-            conn.close()
+        model_rows = execute_query('SELECT model_path FROM training_jobs WHERE id = %s', (base_job_id,))
+        if not model_rows:
             raise ValueError(f"基础模型不存在: {base_job_id}")
         
-        base_model_path = model_row[0]
+        base_model_path = model_rows[0]['model_path']
         
         try:
             # 更新状态
-            cursor.execute('''
+            execute_update('''
                 UPDATE online_learning_tasks 
-                SET status = 'training' WHERE id = ?
+                SET status = 'training' WHERE id = %s
             ''', (task_id,))
-            conn.commit()
             
             # 1. 加载原模型包
             model_package = joblib.load(Path(base_model_path) / 'model.joblib')
@@ -187,29 +151,26 @@ class OnlineLearningManager:
             joblib.dump(model_package, new_model_dir / 'model.joblib')
             
             # 7. 更新数据库
-            cursor.execute('''
+            execute_update('''
                 UPDATE online_learning_tasks 
                 SET status = 'completed',
-                    new_samples_count = ?,
-                    accuracy_after = ?,
-                    model_path = ?,
+                    new_samples_count = %s,
+                    accuracy_after = %s,
+                    model_path = %s,
                     completed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = %s
             ''', (new_samples, new_accuracy, str(new_model_dir), task_id))
             
             # 创建新的训练任务记录
             new_job_id = f"{base_job_id}_v{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            cursor.execute('''
+            execute_update('''
                 INSERT INTO training_jobs 
                 (id, project_id, dataset_id, model_name, status, best_accuracy, model_path, config)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ''', (new_job_id, project_id, 'incremental', 
                   config.get('model_type', 'unknown'),
                   'completed', new_accuracy, str(new_model_dir),
                   json.dumps(config)))
-            
-            conn.commit()
-            conn.close()
             
             return {
                 'success': True,
@@ -223,50 +184,44 @@ class OnlineLearningManager:
             
         except Exception as e:
             logger.error(f"增量学习失败: {e}")
-            cursor.execute('''
+            execute_update('''
                 UPDATE online_learning_tasks 
-                SET status = 'failed' WHERE id = ?
+                SET status = 'failed' WHERE id = %s
             ''', (task_id,))
-            conn.commit()
-            conn.close()
             raise
     
     def get_learning_history(self, project_id: str, job_id: str = None) -> List[Dict]:
         """获取在线学习历史"""
-        conn = self._get_db_connection()
-        cursor = conn.cursor()
-        
         if job_id:
-            cursor.execute('''
+            rows = execute_query('''
                 SELECT id, learning_type, status, new_samples_count, 
                        accuracy_before, accuracy_after, created_at, completed_at
                 FROM online_learning_tasks
-                WHERE project_id = ? AND base_job_id = ?
+                WHERE project_id = %s AND base_job_id = %s
                 ORDER BY created_at DESC
             ''', (project_id, job_id))
         else:
-            cursor.execute('''
+            rows = execute_query('''
                 SELECT id, learning_type, status, new_samples_count,
                        accuracy_before, accuracy_after, created_at, completed_at
                 FROM online_learning_tasks
-                WHERE project_id = ?
+                WHERE project_id = %s
                 ORDER BY created_at DESC
             ''', (project_id,))
         
         history = []
-        for row in cursor.fetchall():
+        for row in rows:
             history.append({
-                'task_id': row[0],
-                'learning_type': row[1],
-                'status': row[2],
-                'new_samples': row[3],
-                'accuracy_before': row[4],
-                'accuracy_after': row[5],
-                'created_at': row[6],
-                'completed_at': row[7]
+                'task_id': row['id'],
+                'learning_type': row['learning_type'],
+                'status': row['status'],
+                'new_samples': row['new_samples_count'],
+                'accuracy_before': row['accuracy_before'],
+                'accuracy_after': row['accuracy_after'],
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                'completed_at': row['completed_at'].isoformat() if row['completed_at'] else None
             })
         
-        conn.close()
         return history
     
     def rollback_model(self, job_id: str, target_version: str = None) -> Dict:
@@ -277,53 +232,53 @@ class OnlineLearningManager:
             job_id: 当前模型ID
             target_version: 目标版本ID，None则回滚到上一个版本
         """
-        conn = self._get_db_connection()
-        cursor = conn.cursor()
-        
         # 查找历史版本
         base_id = job_id.split('_v')[0]  # 去掉版本号
         
-        cursor.execute('''
+        rows = execute_query('''
             SELECT id, model_path, best_accuracy, created_at
             FROM training_jobs
-            WHERE id LIKE ? AND status = 'completed'
+            WHERE id LIKE %s AND status = 'completed'
             ORDER BY created_at DESC
         ''', (f"{base_id}%",))
         
-        versions = cursor.fetchall()
-        if len(versions) < 2:
-            conn.close()
+        if len(rows) < 2:
             return {'success': False, 'message': '没有可回滚的历史版本'}
         
         # 找到目标版本
         if target_version:
-            target = next((v for v in versions if v[0] == target_version), None)
+            target = next((v for v in rows if v['id'] == target_version), None)
         else:
-            target = versions[1]  # 上一个版本
+            target = rows[1]  # 上一个版本
         
         if not target:
-            conn.close()
             return {'success': False, 'message': '目标版本不存在'}
         
-        target_id, target_path, target_acc, target_time = target
+        target_id = target['id']
+        target_path = target['model_path']
+        target_acc = target['best_accuracy']
+        target_time = target['created_at']
         
-        # 更新当前模型指向
-        cursor.execute('''
-            UPDATE training_jobs 
-            SET model_path = ?, best_accuracy = ?, 
-                config = json_set(config, '$.rolled_back_from', ?)
-            WHERE id = ?
-        ''', (target_path, target_acc, job_id, job_id))
-        
-        conn.commit()
-        conn.close()
+        # 更新当前模型指向 - 使用 jsonb_set 替代 json_set
+        current_config_rows = execute_query('SELECT config FROM training_jobs WHERE id = %s', (job_id,))
+        if current_config_rows:
+            current_config = current_config_rows[0]['config'] or {}
+            if isinstance(current_config, str):
+                current_config = json.loads(current_config)
+            current_config['rolled_back_from'] = job_id
+            
+            execute_update('''
+                UPDATE training_jobs 
+                SET model_path = %s, best_accuracy = %s, config = %s
+                WHERE id = %s
+            ''', (target_path, target_acc, json.dumps(current_config), job_id))
         
         return {
             'success': True,
             'message': f'已回滚到版本 {target_id}',
             'target_version': target_id,
             'target_accuracy': target_acc,
-            'target_time': target_time
+            'target_time': target_time.isoformat() if target_time else None
         }
     
     def setup_auto_learning(self, project_id: str, job_id: str, 
@@ -338,47 +293,25 @@ class OnlineLearningManager:
             min_samples: 触发学习的最小新样本数
             accuracy_threshold: 准确率下降多少触发重训练
         """
-        conn = self._get_db_connection()
-        cursor = conn.cursor()
-        
-        # 创建自动学习配置表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS auto_learning_config (
-                id TEXT PRIMARY KEY,
-                project_id TEXT,
-                job_id TEXT,
-                schedule TEXT,
-                min_samples INTEGER,
-                accuracy_threshold REAL,
-                is_active INTEGER DEFAULT 1,
-                last_trigger_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (project_id) REFERENCES projects(id),
-                FOREIGN KEY (job_id) REFERENCES training_jobs(id)
-            )
-        ''')
-        
         config_id = f"al_{project_id}_{job_id}"
         
         # 检查是否已存在
-        cursor.execute('SELECT id FROM auto_learning_config WHERE id = ?', (config_id,))
-        if cursor.fetchone():
+        rows = execute_query('SELECT id FROM auto_learning_config WHERE id = %s', (config_id,))
+        
+        if rows:
             # 更新
-            cursor.execute('''
+            execute_update('''
                 UPDATE auto_learning_config
-                SET schedule = ?, min_samples = ?, accuracy_threshold = ?, is_active = 1
-                WHERE id = ?
+                SET schedule = %s, min_samples = %s, accuracy_threshold = %s, is_active = TRUE
+                WHERE id = %s
             ''', (schedule, min_samples, accuracy_threshold, config_id))
         else:
             # 创建
-            cursor.execute('''
+            execute_update('''
                 INSERT INTO auto_learning_config
                 (id, project_id, job_id, schedule, min_samples, accuracy_threshold)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
             ''', (config_id, project_id, job_id, schedule, min_samples, accuracy_threshold))
-        
-        conn.commit()
-        conn.close()
         
         return config_id
 
@@ -387,32 +320,33 @@ def check_and_trigger_auto_learning():
     """
     检查并触发自动学习 - 应由定时任务调用
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute('''
+        rows = execute_query('''
             SELECT id, project_id, job_id, schedule, min_samples, last_trigger_at
             FROM auto_learning_config
-            WHERE is_active = 1
+            WHERE is_active = TRUE
         ''')
         
-        configs = cursor.fetchall()
         manager = OnlineLearningManager()
         
-        for config in configs:
-            config_id, project_id, job_id, schedule, min_samples, last_trigger = config
+        for row in rows:
+            config_id = row['id']
+            project_id = row['project_id']
+            job_id = row['job_id']
+            schedule = row['schedule']
+            min_samples = row['min_samples']
+            last_trigger = row['last_trigger_at']
             
             # 检查是否满足触发条件
             should_trigger = False
             
             if schedule == 'daily':
                 if not last_trigger or \
-                   datetime.now() - datetime.fromisoformat(last_trigger) > timedelta(days=1):
+                   datetime.now() - last_trigger > timedelta(days=1):
                     should_trigger = True
             elif schedule == 'weekly':
                 if not last_trigger or \
-                   datetime.now() - datetime.fromisoformat(last_trigger) > timedelta(weeks=1):
+                   datetime.now() - last_trigger > timedelta(weeks=1):
                     should_trigger = True
             
             if should_trigger:
@@ -425,17 +359,36 @@ def check_and_trigger_auto_learning():
                 # TODO: 获取新数据路径并执行学习
                 
                 # 更新触发时间
-                cursor.execute('''
+                execute_update('''
                     UPDATE auto_learning_config
                     SET last_trigger_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = %s
                 ''', (config_id,))
-                conn.commit()
         
     except Exception as e:
         logger.error(f"自动学习检查失败: {e}")
-    finally:
-        conn.close()
+
+
+def get_auto_learning_configs(project_id: str) -> List[Dict]:
+    """获取项目的自动学习配置 - 用于 main.py API"""
+    rows = execute_query('''
+        SELECT id, job_id, schedule, min_samples, accuracy_threshold, is_active
+        FROM auto_learning_config
+        WHERE project_id = %s
+    ''', (project_id,))
+    
+    configs = []
+    for row in rows:
+        configs.append({
+            "id": row['id'],
+            "job_id": row['job_id'],
+            "schedule": row['schedule'],
+            "min_samples": row['min_samples'],
+            "accuracy_threshold": row['accuracy_threshold'],
+            "is_active": bool(row['is_active'])
+        })
+    
+    return configs
 
 
 if __name__ == "__main__":

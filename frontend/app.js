@@ -91,7 +91,8 @@ const Icons = {
   Sparkles: () => '✨',
   Refresh: () => '🔄',
   Edit: () => '✏️',
-  Image: () => '🖼️'
+  Image: () => '🖼️',
+  Server: () => '🖥️'
 };
 
 // 训练配置模板
@@ -518,6 +519,15 @@ function ProjectDetail({ project, onBack }) {
                   availableIn: ['data', 'annotate']
                 },
                 { 
+                  id: 'modelservices', 
+                  icon: <Icons.Server />, 
+                  label: '模型服务', 
+                  stage: '部署后',
+                  stageColor: 'indigo',
+                  desc: '管理推理服务和监控',
+                  availableIn: ['deploy', 'test']
+                },
+                { 
                   id: 'xai', 
                   icon: <Icons.Help />, 
                   label: '可解释性', 
@@ -575,8 +585,8 @@ function ProjectDetail({ project, onBack }) {
               {activeTab === 'data' && '💡 当前阶段可用: 时序分析'}
               {activeTab === 'annotate' && '💡 当前阶段可用: 时序分析'}
               {activeTab === 'train' && '💡 当前阶段可用: AutoML超参优化、可解释性'}
-              {activeTab === 'deploy' && '💡 当前阶段可用: 可解释性、在线学习、告警'}
-              {activeTab === 'test' && '💡 当前阶段可用: 可解释性、在线学习、告警'}
+              {activeTab === 'deploy' && '💡 当前阶段可用: 可解释性、模型服务、在线学习、告警'}
+              {activeTab === 'test' && '💡 当前阶段可用: 可解释性、模型服务、在线学习、告警'}
               {['data', 'annotate', 'train', 'deploy', 'test'].includes(activeTab) ? '' : '💡 在核心流程中使用高级工具'}
             </p>
           </div>
@@ -612,6 +622,9 @@ function ProjectDetail({ project, onBack }) {
       )}
       {activeTab === 'xai' && (
         <XAITab projectId={project.id} jobs={jobs} projectType={project.task_type} />
+      )}
+      {activeTab === 'modelservices' && (
+        <ModelServicesTab projectId={project.id} jobs={jobs} />
       )}
 
     </div>
@@ -5674,6 +5687,679 @@ function TestTab({ projectId, projectType, jobs }) {
           <li>• 部署后的模型可通过 API 接口在生产环境调用</li>
         </ul>
       </div>
+    </div>
+  );
+}
+
+// 模型服务管理 Tab - 推理服务监控运营
+function ModelServicesTab({ projectId, jobs }) {
+  const [services, setServices] = useState([]);
+  const [memoryStatus, setMemoryStatus] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [stats, setStats] = useState({ totalCalls: 0, avgLatency: 0, successRate: 100, errorCount: 0 });
+  const [trends, setTrends] = useState([]);
+  const [latencyDist, setLatencyDist] = useState([]);
+  const [recentLogs, setRecentLogs] = useState([]);
+  const [activeTab, setActiveTab] = useState('overview');
+  const [alertRules, setAlertRules] = useState([]);
+  const [alerts, setAlerts] = useState([]);
+  const [recommendations, setRecommendations] = useState([]);
+  const [showCreateRule, setShowCreateRule] = useState(false);
+  const [ruleForm, setRuleForm] = useState({ name: '', rule_type: 'error_rate', threshold_value: 10, time_window_minutes: 5 });
+
+  // 加载服务列表和内存状态
+  const loadServices = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/system/memory`);
+      const data = await res.json();
+      setMemoryStatus(data);
+      setServices(data.models || []);
+    } catch (e) {
+      console.error('加载服务状态失败:', e);
+    }
+  };
+
+  // 加载推理统计
+  const loadStats = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/stats`);
+      if (res.ok) {
+        const data = await res.json();
+        setStats(data);
+      }
+    } catch (e) {
+      console.error('加载统计失败:', e);
+    }
+  };
+
+  // 加载趋势数据
+  const loadTrends = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/trends?hours=24`);
+      if (res.ok) {
+        const data = await res.json();
+        setTrends(data.trends || []);
+      }
+    } catch (e) {
+      console.error('加载趋势失败:', e);
+    }
+  };
+
+  // 加载延迟分布
+  const loadLatencyDist = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/latency-distribution`);
+      if (res.ok) {
+        const data = await res.json();
+        setLatencyDist(data.distribution || []);
+      }
+    } catch (e) {
+      console.error('加载延迟分布失败:', e);
+    }
+  };
+
+  // 加载最近日志
+  const loadRecentLogs = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/recent-logs?limit=50`);
+      if (res.ok) {
+        const data = await res.json();
+        setRecentLogs(data.logs || []);
+      }
+    } catch (e) {
+      console.error('加载日志失败:', e);
+    }
+  };
+
+  // 加载告警规则
+  const loadAlertRules = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/alert-rules`);
+      if (res.ok) {
+        const data = await res.json();
+        setAlertRules(data.rules || []);
+      }
+    } catch (e) {
+      console.error('加载告警规则失败:', e);
+    }
+  };
+
+  // 加载告警记录
+  const loadAlerts = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/alerts?limit=20`);
+      if (res.ok) {
+        const data = await res.json();
+        setAlerts(data.alerts || []);
+      }
+    } catch (e) {
+      console.error('加载告警失败:', e);
+    }
+  };
+
+  // 加载优化建议
+  const loadRecommendations = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/recommendations`);
+      if (res.ok) {
+        const data = await res.json();
+        setRecommendations(data.recommendations || []);
+      }
+    } catch (e) {
+      console.error('加载优化建议失败:', e);
+    }
+  };
+
+  // 创建告警规则
+  const createAlertRule = async () => {
+    if (!ruleForm.name) {
+      alert('请输入规则名称');
+      return;
+    }
+    try {
+      const form = new FormData();
+      form.append('name', ruleForm.name);
+      form.append('rule_type', ruleForm.rule_type);
+      form.append('threshold_value', ruleForm.threshold_value);
+      form.append('time_window_minutes', ruleForm.time_window_minutes);
+      
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/alert-rules`, {
+        method: 'POST',
+        body: form
+      });
+      if (res.ok) {
+        setShowCreateRule(false);
+        setRuleForm({ name: '', rule_type: 'error_rate', threshold_value: 10, time_window_minutes: 5 });
+        loadAlertRules();
+      }
+    } catch (e) {
+      alert('创建失败: ' + e.message);
+    }
+  };
+
+  // 删除告警规则
+  const deleteAlertRule = async (ruleId) => {
+    if (!confirm('确定要删除这个告警规则吗？')) return;
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/alert-rules/${ruleId}`, {
+        method: 'DELETE'
+      });
+      if (res.ok) {
+        loadAlertRules();
+      }
+    } catch (e) {
+      alert('删除失败: ' + e.message);
+    }
+  };
+
+  // 切换告警规则状态
+  const toggleAlertRule = async (ruleId) => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/alert-rules/${ruleId}/toggle`, {
+        method: 'POST'
+      });
+      if (res.ok) {
+        loadAlertRules();
+      }
+    } catch (e) {
+      alert('操作失败: ' + e.message);
+    }
+  };
+
+  // 确认告警
+  const acknowledgeAlert = async (alertId) => {
+    try {
+      const res = await fetch(`${API_BASE}/inference/alerts/${alertId}/acknowledge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user: 'admin' })
+      });
+      if (res.ok) {
+        loadAlerts();
+      }
+    } catch (e) {
+      alert('确认失败: ' + e.message);
+    }
+  };
+
+  // 手动检查告警
+  const checkAlerts = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/inference/check-alerts`, {
+        method: 'POST'
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.triggered_alerts.length > 0) {
+          alert(`发现 ${data.triggered_alerts.length} 个新告警`);
+        } else {
+          alert('未发现异常');
+        }
+        loadAlerts();
+      }
+    } catch (e) {
+      alert('检查失败: ' + e.message);
+    }
+    setLoading(false);
+  };
+
+  // 手动加载模型到内存
+  const loadModel = async (jobId) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/jobs/${jobId}/load`, {
+        method: 'POST'
+      });
+      if (res.ok) {
+        alert('模型已加载到内存');
+        loadServices();
+      } else {
+        alert('加载失败');
+      }
+    } catch (e) {
+      alert('加载失败: ' + e.message);
+    }
+    setLoading(false);
+  };
+
+  // 卸载模型
+  const unloadModel = async (modelId) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/inference/unload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model_id: modelId })
+      });
+      if (res.ok) {
+        alert('模型已卸载');
+        loadServices();
+      }
+    } catch (e) {
+      alert('卸载失败: ' + e.message);
+    }
+    setLoading(false);
+  };
+
+  // 清理所有模型
+  const cleanupAll = async () => {
+    if (!confirm('确定要清理所有已加载的模型吗？')) return;
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/inference/cleanup`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        alert(`已清理完成，释放 ${data.memory_freed_gb?.toFixed(2) || 0} GB 内存`);
+        loadServices();
+      }
+    } catch (e) {
+      alert('清理失败: ' + e.message);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    loadServices();
+    loadStats();
+    loadTrends();
+    loadLatencyDist();
+    loadRecentLogs();
+    loadAlertRules();
+    loadAlerts();
+    loadRecommendations();
+    // 每10秒刷新一次
+    const interval = setInterval(() => {
+      loadServices();
+      loadStats();
+      loadTrends();
+      loadRecentLogs();
+      loadAlerts();
+      loadRecommendations();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [projectId]);
+
+  const completedJobs = jobs?.filter(j => j.status === 'completed') || [];
+  const isHighMemory = memoryStatus?.memory_percent > 80;
+  const isCritical = memoryStatus?.memory_percent > 90;
+
+  return (
+    <div className="space-y-6">
+      {/* 运营概览卡片 */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-4 border border-gray-200/50 shadow-lg">
+          <div className="flex items-center gap-2 mb-2">
+            <Icons.Server />
+            <span className="text-sm text-gray-600">活跃服务</span>
+          </div>
+          <div className="text-2xl font-bold text-indigo-600">{services.length}</div>
+          <div className="text-xs text-gray-500">已加载模型</div>
+        </div>
+        <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-4 border border-gray-200/50 shadow-lg">
+          <div className="flex items-center gap-2 mb-2">
+            <Icons.Activity />
+            <span className="text-sm text-gray-600">总调用次数</span>
+          </div>
+          <div className="text-2xl font-bold text-blue-600">{stats.totalCalls}</div>
+          <div className="text-xs text-gray-500">累计推理请求</div>
+        </div>
+        <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-4 border border-gray-200/50 shadow-lg">
+          <div className="flex items-center gap-2 mb-2">
+            <Icons.Clock />
+            <span className="text-sm text-gray-600">平均延迟</span>
+          </div>
+          <div className="text-2xl font-bold text-green-600">{stats.avgLatency}ms</div>
+          <div className="text-xs text-gray-500">响应时间</div>
+        </div>
+        <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-4 border border-gray-200/50 shadow-lg">
+          <div className="flex items-center gap-2 mb-2">
+            <Icons.Check />
+            <span className="text-sm text-gray-600">成功率</span>
+          </div>
+          <div className="text-2xl font-bold text-purple-600">{stats.successRate}%</div>
+          <div className="text-xs text-gray-500">服务可用性</div>
+        </div>
+      </div>
+
+      {/* 内存状态面板 */}
+      <div className={`p-4 rounded-xl border ${
+        isCritical ? 'bg-red-50 border-red-200' :
+        isHighMemory ? 'bg-orange-50 border-orange-200' :
+        'bg-blue-50 border-blue-200'
+      }`}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Icons.Memory />
+            <span className="font-medium text-gray-800">系统内存状态</span>
+            {isCritical && <span className="px-2 py-0.5 bg-red-500 text-white rounded text-xs">危险</span>}
+            {isHighMemory && !isCritical && <span className="px-2 py-0.5 bg-orange-500 text-white rounded text-xs">告警</span>}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={loadServices} className="text-xs text-gray-500 hover:text-gray-700 px-3 py-1 bg-white rounded">
+              <Icons.Refresh /> 刷新
+            </button>
+            <button 
+              onClick={cleanupAll}
+              disabled={loading || services.length === 0}
+              className="text-xs px-3 py-1 bg-red-100 text-red-700 rounded hover:bg-red-200 disabled:opacity-50"
+            >
+              {loading ? '处理中...' : '🧹 清理所有'}
+            </button>
+          </div>
+        </div>
+
+        {memoryStatus && (
+          <React.Fragment>
+            <div className="mb-3">
+              <div className="flex justify-between text-sm text-gray-600 mb-1">
+                <span>已使用 {memoryStatus.memory_percent?.toFixed(1)}%</span>
+                <span>{memoryStatus.memory_used_gb?.toFixed(1)} / {memoryStatus.memory_total_gb?.toFixed(1)} GB</span>
+              </div>
+              <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all ${
+                    isCritical ? 'bg-red-500' :
+                    isHighMemory ? 'bg-orange-500' :
+                    'bg-green-500'
+                  }`}
+                  style={{ width: `${Math.min(memoryStatus.memory_percent || 0, 100)}%` }}
+                />
+              </div>
+            </div>
+            <div className="text-xs text-gray-500">
+              💡 自动管理: 内存&gt;80%触发清理 · 30分钟空闲自动卸载 · 最多保留{memoryStatus.max_models_limit}个模型
+            </div>
+          </React.Fragment>
+        )}
+      </div>
+
+      {/* 优化建议 */}
+      {recommendations.length > 0 && (
+        <div className="bg-gradient-to-r from-amber-50 to-orange-50 rounded-2xl p-6 border border-amber-200">
+          <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <Icons.Sparkles /> 运营优化建议
+          </h3>
+          <div className="space-y-3">
+            {recommendations.map((rec, idx) => (
+              <div key={idx} className={`p-3 rounded-lg ${
+                rec.priority === 'critical' ? 'bg-red-100 border border-red-200' :
+                rec.priority === 'high' ? 'bg-orange-100 border border-orange-200' :
+                'bg-white border border-gray-200'
+              }`}>
+                <div className="flex items-start justify-between">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={`text-xs px-2 py-0.5 rounded ${
+                        rec.priority === 'critical' ? 'bg-red-500 text-white' :
+                        rec.priority === 'high' ? 'bg-orange-500 text-white' :
+                        'bg-gray-500 text-white'
+                      }`}>
+                        {rec.priority === 'critical' ? '紧急' : rec.priority === 'high' ? '重要' : '建议'}
+                      </span>
+                      <span className="font-medium text-sm">{rec.title}</span>
+                    </div>
+                    <p className="text-xs text-gray-600">{rec.description}</p>
+                  </div>
+                  <span className="text-xs text-gray-400 ml-2">{rec.action}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 活跃告警 */}
+      {alerts.filter(a => a.status === 'active').length > 0 && (
+        <div className="bg-red-50 rounded-2xl p-6 border border-red-200">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-red-800 flex items-center gap-2">
+              <Icons.Bell /> 活跃告警 ({alerts.filter(a => a.status === 'active').length})
+            </h3>
+            <button 
+              onClick={checkAlerts}
+              disabled={loading}
+              className="text-xs px-3 py-1 bg-white text-red-600 rounded border border-red-200 hover:bg-red-50"
+            >
+              {loading ? '检查中...' : '🔍 立即检查'}
+            </button>
+          </div>
+          <div className="space-y-2">
+            {alerts.filter(a => a.status === 'active').map((alert, idx) => (
+              <div key={idx} className="p-3 bg-white rounded-lg border border-red-100">
+                <div className="flex items-start justify-between">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={`text-xs px-2 py-0.5 rounded ${
+                        alert.severity === 'critical' ? 'bg-red-500 text-white' : 'bg-orange-500 text-white'
+                      }`}>
+                        {alert.severity === 'critical' ? '严重' : '警告'}
+                      </span>
+                      <span className="font-medium text-sm">{alert.title}</span>
+                    </div>
+                    <p className="text-xs text-gray-600">{alert.message}</p>
+                    <div className="text-xs text-gray-400 mt-1">
+                      当前值: {alert.metricValue?.toFixed ? alert.metricValue.toFixed(2) : alert.metricValue} / 阈值: {alert.thresholdValue}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => acknowledgeAlert(alert.id)}
+                    className="text-xs px-3 py-1 bg-red-100 text-red-700 rounded hover:bg-red-200"
+                  >
+                    确认
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 已加载模型列表 */}
+      <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+        <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+          <Icons.Server /> 已加载模型服务
+        </h3>
+        
+        {services.length === 0 ? (
+          <div className="text-center py-8 text-gray-500">
+            <Icons.Server className="w-12 h-12 mx-auto mb-4 text-gray-300" />
+            <p>暂无已加载的模型服务</p>
+            <p className="text-sm">从下方列表加载模型到内存</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {services.map((service, idx) => (
+              <div key={idx} className="p-3 bg-gray-50 rounded-lg flex items-center justify-between">
+                <div className="flex-1">
+                  <div className="font-medium text-sm">{service.model_id}</div>
+                  <div className="text-xs text-gray-500">
+                    类型: {service.model_type} · 
+                    内存: {service.memory_size_mb}MB · 
+                    访问: {service.access_count}次 · 
+                    空闲: {service.idle_seconds}s
+                  </div>
+                </div>
+                <button
+                  onClick={() => unloadModel(service.model_id)}
+                  disabled={loading}
+                  className="px-3 py-1 bg-red-100 text-red-700 rounded text-xs font-medium hover:bg-red-200 disabled:opacity-50"
+                >
+                  卸载
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 可用模型列表 */}
+      <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+        <h3 className="font-semibold text-gray-800 mb-4">可用模型（已训练完成）</h3>
+        
+        {completedJobs.length === 0 ? (
+          <div className="text-center py-8 text-gray-500">
+            <Icons.Brain className="w-12 h-12 mx-auto mb-4 text-gray-300" />
+            <p>暂无可用模型</p>
+            <p className="text-sm">请先完成模型训练</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {completedJobs.map(job => {
+              const isLoaded = services.some(s => s.model_id === `${projectId}/${job.id}`);
+              return (
+                <div key={job.id} className="p-3 bg-gray-50 rounded-lg flex items-center justify-between">
+                  <div className="flex-1">
+                    <div className="font-medium text-sm">{job.model_name}</div>
+                    <div className="text-xs text-gray-500">
+                      准确率: {(job.best_accuracy * 100).toFixed(2)}% · 
+                      训练时间: {new Date(job.completed_at).toLocaleString()}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {isLoaded ? (
+                      <span className="px-2 py-1 bg-green-100 text-green-700 rounded text-xs">已加载</span>
+                    ) : (
+                      <button
+                        onClick={() => loadModel(job.id)}
+                        disabled={loading || services.length >= (memoryStatus?.max_models_limit || 5)}
+                        className="px-3 py-1 bg-indigo-100 text-indigo-700 rounded text-xs font-medium hover:bg-indigo-200 disabled:opacity-50"
+                      >
+                        加载到内存
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* 详细统计面板 */}
+      {stats.totalCalls > 0 && (
+        <div className="bg-white/80 backdrop-blur-xl rounded-2xl p-6 border border-gray-200/50 shadow-lg">
+          <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <Icons.Chart /> 推理调用分析
+          </h3>
+          
+          {/* 子标签页 */}
+          <div className="flex gap-2 mb-4 border-b">
+            {[
+              { id: 'trends', label: '调用趋势', icon: '📈' },
+              { id: 'latency', label: '延迟分布', icon: '⏱️' },
+              { id: 'logs', label: '最近日志', icon: '📋' }
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                  activeTab === tab.id
+                    ? 'border-indigo-500 text-indigo-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700'
+                }`}
+              >
+                {tab.icon} {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {/* 调用趋势 */}
+          {activeTab === 'trends' && (
+            <div>
+              {trends.length === 0 ? (
+                <p className="text-gray-500 text-center py-4">暂无趋势数据</p>
+              ) : (
+                <div className="space-y-3">
+                  <div className="text-xs text-gray-500 mb-2">最近24小时调用趋势</div>
+                  {trends.slice(0, 12).map((t, idx) => (
+                    <div key={idx} className="flex items-center gap-3">
+                      <div className="w-20 text-xs text-gray-600">
+                        {new Date(t.hour).getHours()}:00
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <div 
+                            className="h-4 bg-blue-500 rounded"
+                            style={{ width: `${Math.min((t.callCount / Math.max(...trends.map(x => x.callCount))) * 100, 100)}%` }}
+                          />
+                          <span className="text-xs text-gray-600">{t.callCount}次</span>
+                        </div>
+                      </div>
+                      <div className="w-20 text-xs text-gray-500">
+                        {t.avgLatency}ms
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 延迟分布 */}
+          {activeTab === 'latency' && (
+            <div>
+              {latencyDist.length === 0 ? (
+                <p className="text-gray-500 text-center py-4">暂无延迟数据</p>
+              ) : (
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                  {latencyDist.map((item, idx) => (
+                    <div key={idx} className="p-3 bg-gray-50 rounded-lg text-center">
+                      <div className="text-2xl font-bold text-indigo-600">{item.count}</div>
+                      <div className="text-xs text-gray-500">{item.range}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="mt-4 p-3 bg-blue-50 rounded-lg text-xs text-blue-700">
+                💡 延迟分布说明：展示成功推理请求的响应时间分布，帮助你了解模型服务的性能表现
+              </div>
+            </div>
+          )}
+
+          {/* 最近日志 */}
+          {activeTab === 'logs' && (
+            <div className="max-h-64 overflow-auto">
+              {recentLogs.length === 0 ? (
+                <p className="text-gray-500 text-center py-4">暂无日志记录</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500">时间</th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500">模型</th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500">延迟</th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {recentLogs.map((log, idx) => (
+                      <tr key={idx} className={log.success ? '' : 'bg-red-50'}>
+                        <td className="px-3 py-2 text-xs text-gray-600">
+                          {new Date(log.createdAt).toLocaleTimeString()}
+                        </td>
+                        <td className="px-3 py-2 text-xs text-gray-800 truncate max-w-[150px]">
+                          {log.modelName}
+                        </td>
+                        <td className="px-3 py-2 text-xs text-gray-600">
+                          {log.latencyMs}ms
+                        </td>
+                        <td className="px-3 py-2">
+                          {log.success ? (
+                            <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded text-xs">成功</span>
+                          ) : (
+                            <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded text-xs" title={log.errorMessage}>失败</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
