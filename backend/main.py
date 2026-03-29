@@ -105,9 +105,27 @@ async def health_check():
 @app.get("/metrics")
 async def prometheus_metrics():
     """Prometheus监控指标端点"""
-    from metrics_collector import get_metrics_response, CONTENT_TYPE_LATEST
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from fastapi.responses import Response
+    
+    # 更新系统指标
+    try:
+        metrics.update_system_metrics(
+            loaded_models=len(inference_service.models)
+        )
+    except:
+        pass
+    
+    # 更新活跃项目数
+    try:
+        rows = execute_query('SELECT COUNT(*) as cnt FROM projects')
+        if rows:
+            metrics.update_active_projects(rows[0]['cnt'])
+    except:
+        pass
+    
     return Response(
-        content=get_metrics_response(),
+        content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST
     )
 
@@ -1168,6 +1186,18 @@ async def inference_predict(project_id: str, job_id: str, text: str = Form(...))
             INSERT INTO inference_logs (project_id, job_id, model_id, input_data, output_data, latency_ms, success)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         ''', (project_id, job_id, model_id, json.dumps({"text": text}), json.dumps(result), latency_ms, True))
+        
+        # 记录 Prometheus 指标
+        try:
+            confidence = result.get('confidence', 0)
+            metrics.record_prediction(
+                model_type='nlp',
+                latency=latency_ms/1000.0,
+                confidence=confidence,
+                success=True
+            )
+        except:
+            pass
         
         return {
             "success": True,

@@ -1,0 +1,74 @@
+# Prometheus 告警规则
+groups:
+  - name: ai_training_alerts
+    interval: 30s
+    rules:
+      # 训练失败告警
+      - alert: TrainingJobFailed
+        expr: increase(ai_training_total{status="failed"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "训练任务失败"
+          description: "最近5分钟内有训练任务失败"
+
+      # 推理延迟过高
+      - alert: HighPredictionLatency
+        expr: histogram_quantile(0.95, rate(ai_prediction_latency_seconds_bucket[5m])) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "推理延迟过高"
+          description: "95分位推理延迟超过2秒"
+
+      # 推理错误率过高
+      - alert: HighPredictionErrorRate
+        expr: rate(ai_prediction_total{status="error"}[5m]) / rate(ai_prediction_total[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "推理错误率过高"
+          description: "推理错误率超过10%"
+
+      # 内存使用率过高
+      - alert: HighMemoryUsage
+        expr: ai_system_memory_percent > 85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "系统内存使用率超过85%"
+
+      # CPU使用率过高
+      - alert: HighCPUUsage
+        expr: ai_system_cpu_percent > 80
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU使用率过高"
+          description: "系统CPU使用率超过80%超过3分钟"
+
+      # 模型准确率下降
+      - alert: ModelAccuracyDrop
+        expr: ai_model_accuracy < 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "模型准确率过低"
+          description: "模型准确率低于50%"
+
+      # 服务可能宕机（无指标上报）
+      - alert: ServiceDown
+        expr: up{job="ai-training-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AI训练平台服务可能宕机"
+          description: "API服务超过1分钟无响应"
