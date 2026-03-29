@@ -1160,7 +1160,7 @@ async def inference_predict(project_id: str, job_id: str, text: str = Form(...))
     
     # 执行预测
     try:
-        result = inference_service.predict_single(text, model_id)
+        result = inference_service.predict([text], model_id)[0]
         latency_ms = int((time.time() - start_time) * 1000)
         
         # 记录推理日志
@@ -4778,6 +4778,647 @@ async def delete_automl_experiment(experiment_id: str):
     execute_update("DELETE FROM automl_experiments WHERE id = %s", (experiment_id,))
     
     return {"success": True, "message": "实验及关联参数组已删除"}
+
+
+# ============ A/B 测试 API ============
+
+@app.post("/api/projects/{project_id}/ab-tests")
+async def create_ab_test(
+    project_id: str,
+    name: str = Form(...),
+    description: str = Form(""),
+    model_a_id: str = Form(...),
+    model_b_id: str = Form(...),
+    traffic_split_a: int = Form(50),
+    traffic_split_b: int = Form(50),
+    min_sample_size: int = Form(100)
+):
+    """
+    创建 A/B 测试实验
+    
+    Args:
+        model_a_id: 控制组模型（原模型）
+        model_b_id: 实验组模型（新模型）
+        traffic_split_a/b: 流量分配比例，默认各50%
+        min_sample_size: 最小样本数才判定结果
+    """
+    # 验证项目存在
+    rows = execute_query('SELECT id FROM projects WHERE id = %s', (project_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    
+    # 验证两个模型都存在且已完成训练（支持同一模型作为A和B用于测试）
+    for model_id in [model_a_id, model_b_id]:
+        model_rows = execute_query('''
+            SELECT id, status FROM training_jobs 
+            WHERE id = %s AND project_id = %s
+        ''', (model_id, project_id))
+        
+        if not model_rows:
+            raise HTTPException(status_code=400, detail=f"模型 {model_id[:8]} 不存在")
+        
+        if model_rows[0]['status'] != 'completed':
+            raise HTTPException(status_code=400, detail=f"模型 {model_id[:8]} 训练尚未完成")
+    
+    # 验证流量分配
+    if traffic_split_a + traffic_split_b != 100:
+        raise HTTPException(status_code=400, detail="流量分配比例之和必须等于100")
+    
+    test_id = str(uuid.uuid4())
+    
+    execute_update('''
+        INSERT INTO ab_tests (
+            id, project_id, name, description, 
+            model_a_id, model_b_id, traffic_split_a, traffic_split_b,
+            min_sample_size, status, started_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+    ''', (
+        test_id, project_id, name, description,
+        model_a_id, model_b_id, traffic_split_a, traffic_split_b,
+        min_sample_size, 'running'
+    ))
+    
+    return {
+        "success": True,
+        "test_id": test_id,
+        "message": f"A/B测试已创建，流量分配: A={traffic_split_a}%, B={traffic_split_b}%"
+    }
+
+
+@app.get("/api/projects/{project_id}/ab-tests")
+async def list_ab_tests(project_id: str):
+    """获取项目的 A/B 测试列表"""
+    rows = execute_query('''
+        SELECT t.*, 
+               ja.model_name as model_a_name,
+               jb.model_name as model_b_name
+        FROM ab_tests t
+        JOIN training_jobs ja ON t.model_a_id = ja.id
+        JOIN training_jobs jb ON t.model_b_id = jb.id
+        WHERE t.project_id = %s
+        ORDER BY t.created_at DESC
+    ''', (project_id,))
+    
+    tests = []
+    for row in rows:
+        tests.append({
+            "id": row['id'],
+            "name": row['name'],
+            "description": row['description'],
+            "status": row['status'],
+            "model_a": {"id": row['model_a_id'], "name": row['model_a_name']},
+            "model_b": {"id": row['model_b_id'], "name": row['model_b_name']},
+            "traffic_split": {"a": row['traffic_split_a'], "b": row['traffic_split_b']},
+            "calls": {"a": row['model_a_calls'], "b": row['model_b_calls']},
+            "success": {"a": row['model_a_success'], "b": row['model_b_success']},
+            "winner": row['winner_model'],
+            "created_at": row['created_at']
+        })
+    
+    return {"tests": tests, "count": len(tests)}
+
+
+@app.get("/api/projects/{project_id}/ab-tests/{test_id}")
+async def get_ab_test_detail(project_id: str, test_id: str):
+    """获取 A/B 测试详情和统计结果"""
+    rows = execute_query('''
+        SELECT t.*, 
+               ja.model_name as model_a_name,
+               jb.model_name as model_b_name
+        FROM ab_tests t
+        JOIN training_jobs ja ON t.model_a_id = ja.id
+        JOIN training_jobs jb ON t.model_b_id = jb.id
+        WHERE t.id = %s AND t.project_id = %s
+    ''', (test_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="A/B测试不存在")
+    
+    test = rows[0]
+    
+    # 获取详细统计
+    stats = execute_query('''
+        SELECT 
+            variant,
+            COUNT(*) as total_calls,
+            SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_calls,
+            AVG(latency_ms) as avg_latency,
+            SUM(CASE WHEN prediction_correct THEN 1 ELSE 0 END) as correct_predictions
+        FROM ab_test_calls
+        WHERE test_id = %s
+        GROUP BY variant
+    ''', (test_id,))
+    
+    stats_dict = {row['variant']: dict(row) for row in stats}
+    
+    # 计算置信度（简化版，实际应该用统计检验）
+    a_success = test['model_a_success']
+    b_success = test['model_b_success']
+    a_calls = test['model_a_calls']
+    b_calls = test['model_b_calls']
+    
+    a_rate = a_success / a_calls if a_calls > 0 else 0
+    b_rate = b_success / b_calls if b_calls > 0 else 0
+    
+    return {
+        "test": {
+            "id": test['id'],
+            "name": test['name'],
+            "status": test['status'],
+            "model_a": {"id": test['model_a_id'], "name": test['model_a_name']},
+            "model_b": {"id": test['model_b_id'], "name": test['model_b_name']},
+            "traffic_split": {"a": test['traffic_split_a'], "b": test['traffic_split_b']},
+            "min_sample_size": test['min_sample_size']
+        },
+        "statistics": {
+            "model_a": stats_dict.get('A', {}),
+            "model_b": stats_dict.get('B', {})
+        },
+        "comparison": {
+            "a_success_rate": round(a_rate, 4),
+            "b_success_rate": round(b_rate, 4),
+            "difference": round(b_rate - a_rate, 4),
+            "improvement_percent": round((b_rate - a_rate) / a_rate * 100, 2) if a_rate > 0 else 0,
+            "total_calls": a_calls + b_calls,
+            "has_winner": test['winner_model'] is not None,
+            "winner": test['winner_model'],
+            "confidence_level": test['confidence_level']
+        }
+    }
+
+
+@app.post("/api/projects/{project_id}/ab-tests/{test_id}/predict")
+async def ab_test_predict(
+    project_id: str,
+    test_id: str,
+    text: str = Form(...),
+    user_id: str = Form(None)
+):
+    """
+    A/B 测试预测 - 根据流量分配自动路由到模型A或B
+    
+    如果有user_id，确保同一用户始终分配到同一组（一致性哈希）
+    """
+    # 获取测试信息
+    test_rows = execute_query('''
+        SELECT * FROM ab_tests 
+        WHERE id = %s AND project_id = %s AND status = 'running'
+    ''', (test_id, project_id))
+    
+    if not test_rows:
+        raise HTTPException(status_code=404, detail="A/B测试不存在或已停止")
+    
+    test = test_rows[0]
+    
+    # 决定分配到哪个组
+    import hashlib
+    if user_id:
+        # 使用 user_id 做一致性哈希，确保同一用户始终分配到同一组
+        hash_val = int(hashlib.md5(f"{test_id}:{user_id}".encode()).hexdigest(), 16)
+        bucket = hash_val % 100
+        variant = 'A' if bucket < test['traffic_split_a'] else 'B'
+    else:
+        # 随机分配
+        import random
+        variant = 'A' if random.randint(1, 100) <= test['traffic_split_a'] else 'B'
+    
+    model_id = test['model_a_id'] if variant == 'A' else test['model_b_id']
+    
+    # 获取模型路径并加载
+    job_rows = execute_query('SELECT model_path FROM training_jobs WHERE id = %s', (model_id,))
+    if not job_rows:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    
+    model_path = job_rows[0]['model_path']
+    
+    # 加载模型并预测
+    import time
+    start_time = time.time()
+    
+    try:
+        inference_model_id = f"{project_id}/{model_id}"
+        inference_service.load_model(model_path, inference_model_id)
+        result = inference_service.predict([text], inference_model_id)[0]
+        
+        latency_ms = int((time.time() - start_time) * 1000)
+        
+        # 记录调用
+        execute_update('''
+            INSERT INTO ab_test_calls 
+            (test_id, variant, model_id, input_data, output_data, latency_ms, user_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (
+            test_id, variant, model_id,
+            json.dumps({"text": text}),
+            json.dumps(result),
+            latency_ms, user_id
+        ))
+        
+        # 更新统计计数
+        if variant == 'A':
+            execute_update('UPDATE ab_tests SET model_a_calls = model_a_calls + 1 WHERE id = %s', (test_id,))
+        else:
+            execute_update('UPDATE ab_tests SET model_b_calls = model_b_calls + 1 WHERE id = %s', (test_id,))
+        
+        return {
+            "success": True,
+            "variant": variant,
+            "model_used": model_id[:8],
+            "result": result,
+            "latency_ms": latency_ms
+        }
+        
+    except Exception as e:
+        # 记录失败
+        execute_update('''
+            INSERT INTO ab_test_calls 
+            (test_id, variant, model_id, input_data, success, error_message)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (test_id, variant, model_id, json.dumps({"text": text}), False, str(e)))
+        
+        raise HTTPException(status_code=500, detail=f"预测失败: {str(e)}")
+
+
+@app.post("/api/projects/{project_id}/ab-tests/{test_id}/feedback")
+async def submit_ab_test_feedback(
+    project_id: str,
+    test_id: str,
+    call_id: int = Form(...),
+    is_correct: bool = Form(...)
+):
+    """提交 A/B 测试预测结果反馈（用于计算准确率）"""
+    # 验证测试存在
+    test_rows = execute_query('SELECT id FROM ab_tests WHERE id = %s AND project_id = %s', 
+                             (test_id, project_id))
+    if not test_rows:
+        raise HTTPException(status_code=404, detail="A/B测试不存在")
+    
+    # 更新反馈
+    execute_update('''
+        UPDATE ab_test_calls 
+        SET prediction_correct = %s 
+        WHERE id = %s AND test_id = %s
+    ''', (is_correct, call_id, test_id))
+    
+    # 更新成功计数
+    call_rows = execute_query('SELECT variant FROM ab_test_calls WHERE id = %s', (call_id,))
+    if call_rows:
+        variant = call_rows[0]['variant']
+        if is_correct:
+            if variant == 'A':
+                execute_update('UPDATE ab_tests SET model_a_success = model_a_success + 1 WHERE id = %s', (test_id,))
+            else:
+                execute_update('UPDATE ab_tests SET model_b_success = model_b_success + 1 WHERE id = %s', (test_id,))
+    
+    return {"success": True, "message": "反馈已记录"}
+
+
+@app.post("/api/projects/{project_id}/ab-tests/{test_id}/stop")
+async def stop_ab_test(
+    project_id: str,
+    test_id: str,
+    winner: str = Form(None)  # 'model_a', 'model_b', 'tie'
+):
+    """停止 A/B 测试并声明获胜方"""
+    rows = execute_query('SELECT * FROM ab_tests WHERE id = %s AND project_id = %s',
+                        (test_id, project_id))
+    if not rows:
+        raise HTTPException(status_code=404, detail="A/B测试不存在")
+    
+    test = rows[0]
+    
+    # 计算最终统计
+    a_rate = test['model_a_success'] / test['model_a_calls'] if test['model_a_calls'] > 0 else 0
+    b_rate = test['model_b_success'] / test['model_b_calls'] if test['model_b_calls'] > 0 else 0
+    
+    # 如果没有指定获胜方，自动判断
+    if not winner:
+        if a_rate > b_rate:
+            winner = 'model_a'
+        elif b_rate > a_rate:
+            winner = 'model_b'
+        else:
+            winner = 'tie'
+    
+    improvement = abs(b_rate - a_rate) / max(a_rate, 0.0001) * 100
+    
+    execute_update('''
+        UPDATE ab_tests 
+        SET status = 'completed',
+            winner_model = %s,
+            ended_at = CURRENT_TIMESTAMP,
+            improvement_percent = %s
+        WHERE id = %s
+    ''', (winner, improvement, test_id))
+    
+    return {
+        "success": True,
+        "message": f"A/B测试已停止，获胜方: {winner}",
+        "result": {
+            "winner": winner,
+            "model_a_rate": round(a_rate, 4),
+            "model_b_rate": round(b_rate, 4),
+            "improvement_percent": round(improvement, 2)
+        }
+    }
+
+
+@app.delete("/api/projects/{project_id}/ab-tests/{test_id}")
+async def delete_ab_test(project_id: str, test_id: str):
+    """删除 A/B 测试（连带所有调用记录）"""
+    rows = execute_query('SELECT id FROM ab_tests WHERE id = %s AND project_id = %s',
+                        (test_id, project_id))
+    if not rows:
+        raise HTTPException(status_code=404, detail="A/B测试不存在")
+    
+    # 删除调用记录
+    execute_update('DELETE FROM ab_test_calls WHERE test_id = %s', (test_id,))
+    
+    # 删除测试
+    execute_update('DELETE FROM ab_tests WHERE id = %s', (test_id,))
+    
+    return {"success": True, "message": "A/B测试已删除"}
+
+
+# ============ 模型压缩 API ============
+
+from model_compression import quantize_model_pytorch, export_to_onnx, get_model_info
+
+@app.post("/api/projects/{project_id}/models/{job_id}/compress")
+async def compress_model(
+    project_id: str,
+    job_id: str,
+    compression_type: str = Form("quantize"),  # quantize, onnx
+    quantization_type: str = Form("dynamic")   # dynamic, static
+):
+    """
+    模型压缩 - 量化或ONNX导出
+    
+    Args:
+        compression_type: 'quantize'(PyTorch量化), 'onnx'(ONNX导出)
+        quantization_type: 'dynamic'(动态量化), 'static'(静态量化)
+    """
+    # 验证模型存在
+    rows = execute_query('''
+        SELECT model_path, status, model_name FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    
+    job = rows[0]
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="模型训练尚未完成")
+    
+    model_path = Path(job['model_path'])
+    
+    # 查找模型文件
+    model_file = model_path / "pytorch_model.bin"
+    if not model_file.exists():
+        model_file = model_path / "model.pt"
+    if not model_file.exists():
+        model_file = model_path / "best_model.pth"
+    
+    if not model_file.exists():
+        raise HTTPException(status_code=404, detail="找不到模型文件")
+    
+    # 创建压缩目录
+    compressed_dir = model_path / "compressed"
+    compressed_dir.mkdir(exist_ok=True)
+    
+    # 执行压缩
+    if compression_type == "quantize":
+        output_file = compressed_dir / f"model_quantized_{quantization_type}.pth"
+        result = quantize_model_pytorch(
+            str(model_file), 
+            str(output_file), 
+            quantization_type
+        )
+        
+    elif compression_type == "onnx":
+        output_file = compressed_dir / "model.onnx"
+        result = export_to_onnx(str(model_file), str(output_file))
+        
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的压缩类型: {compression_type}")
+    
+    if result.get("success"):
+        result["compressed_path"] = str(output_file)
+        result["download_url"] = f"/api/projects/{project_id}/models/{job_id}/download-compressed"
+    
+    return result
+
+
+@app.get("/api/projects/{project_id}/models/{job_id}/info")
+async def get_model_information(project_id: str, job_id: str):
+    """获取模型信息（大小、参数数量）"""
+    rows = execute_query('''
+        SELECT model_path, status FROM training_jobs 
+        WHERE id = %s AND project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    
+    model_path = Path(rows[0]['model_path'])
+    
+    # 查找模型文件
+    info = {"files": []}
+    for pattern in ["pytorch_model.bin", "model.pt", "best_model.pth", "model.onnx", "*.pth"]:
+        files = list(model_path.glob(pattern))
+        for f in files:
+            file_info = get_model_info(str(f))
+            if "error" not in file_info:
+                info["files"].append(file_info)
+    
+    # 如果有压缩目录，也包含压缩后的文件
+    compressed_dir = model_path / "compressed"
+    if compressed_dir.exists():
+        for f in compressed_dir.glob("*"):
+            file_info = get_model_info(str(f))
+            file_info["is_compressed"] = True
+            info["files"].append(file_info)
+    
+    info["total_files"] = len(info["files"])
+    info["model_path"] = str(model_path)
+    
+    return info
+
+
+# ============ 预训练模型库 API ============
+
+PRETRAINED_MODELS = {
+    "nlp": {
+        "distilbert-base-chinese": {
+            "name": "DistilBERT-Base-Chinese",
+            "description": "轻量级中文BERT，速度快3倍，保留97%精度",
+            "size_mb": 300,
+            "params_millions": 66,
+            "tasks": ["文本分类", "情感分析", "命名实体识别"],
+            "recommended": True
+        },
+        "bert-base-chinese": {
+            "name": "BERT-Base-Chinese",
+            "description": "Google官方中文BERT，精度高",
+            "size_mb": 400,
+            "params_millions": 110,
+            "tasks": ["文本分类", "问答", "语义匹配"],
+            "recommended": False
+        },
+        "chinese-roberta-wwm-ext": {
+            "name": "Chinese-RoBERTa-WWM-Ext",
+            "description": "哈工大版RoBERTa，中文效果更好",
+            "size_mb": 400,
+            "params_millions": 110,
+            "tasks": ["文本分类", "阅读理解", "文本生成"],
+            "recommended": False
+        }
+    },
+    "vision": {
+        "resnet50": {
+            "name": "ResNet-50",
+            "description": "经典图像分类模型，精度速度平衡",
+            "size_mb": 100,
+            "params_millions": 25,
+            "tasks": ["图像分类", "特征提取"],
+            "recommended": True
+        },
+        "efficientnet_b0": {
+            "name": "EfficientNet-B0",
+            "description": "高效图像分类模型，参数更少精度更高",
+            "size_mb": 20,
+            "params_millions": 5.3,
+            "tasks": ["图像分类", "移动端部署"],
+            "recommended": True
+        },
+        "mobilenet_v2": {
+            "name": "MobileNet-V2",
+            "description": "移动端首选，超轻量级",
+            "size_mb": 13,
+            "params_millions": 3.5,
+            "tasks": ["移动端图像分类", "边缘设备"],
+            "recommended": True
+        },
+        "yolov8n": {
+            "name": "YOLOv8-Nano",
+            "description": "超轻量目标检测模型",
+            "size_mb": 6,
+            "params_millions": 3.2,
+            "tasks": ["目标检测", "缺陷检测"],
+            "recommended": True
+        }
+    },
+    "tabular": {
+        "random_forest": {
+            "name": "Random Forest",
+            "description": "经典表格数据模型，可解释性强",
+            "size_mb": 10,
+            "tasks": ["分类", "回归", "特征重要性"],
+            "recommended": True
+        },
+        "xgboost": {
+            "name": "XGBoost",
+            "description": "梯度提升树，表格数据首选",
+            "size_mb": 5,
+            "tasks": ["分类", "回归", "排序"],
+            "recommended": True
+        }
+    }
+}
+
+
+@app.get("/api/models/pretrained")
+async def list_pretrained_models(category: str = None):
+    """
+    获取预训练模型列表
+    
+    Args:
+        category: 'nlp', 'vision', 'tabular'，不传返回全部
+    """
+    if category:
+        if category not in PRETRAINED_MODELS:
+            raise HTTPException(status_code=400, detail=f"不支持的类别: {category}")
+        return {
+            "category": category,
+            "models": PRETRAINED_MODELS[category]
+        }
+    
+    return {
+        "categories": list(PRETRAINED_MODELS.keys()),
+        "models": PRETRAINED_MODELS
+    }
+
+
+@app.post("/api/models/pretrained/download")
+async def download_pretrained_model(
+    model_id: str = Form(...),
+    cache_dir: str = Form("/var/www/ai-training/pretrained_models")
+):
+    """
+    下载预训练模型到本地缓存
+    
+    Args:
+        model_id: 模型ID，如 'distilbert-base-chinese'
+        cache_dir: 本地缓存目录
+    """
+    import os
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    
+    cache_path = Path(cache_dir) / model_id
+    cache_path.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        if model_id in PRETRAINED_MODELS.get("nlp", {}):
+            # 下载 Transformer 模型
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            
+            logger.info(f"正在下载 {model_id}...")
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=2)
+            
+            # 保存到本地
+            tokenizer.save_pretrained(str(cache_path))
+            model.save_pretrained(str(cache_path))
+            
+            return {
+                "success": True,
+                "model_id": model_id,
+                "cache_path": str(cache_path),
+                "message": f"模型 {model_id} 已下载到本地缓存"
+            }
+            
+        else:
+            return {
+                "success": False,
+                "error": f"暂不支持下载模型: {model_id}"
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"下载失败: {str(e)}"
+        }
+
+
+@app.get("/api/models/pretrained/{model_id}/info")
+async def get_pretrained_model_info(model_id: str):
+    """获取预训练模型详细信息"""
+    for category, models in PRETRAINED_MODELS.items():
+        if model_id in models:
+            info = models[model_id].copy()
+            info["id"] = model_id
+            info["category"] = category
+            
+            # 检查本地缓存
+            cache_path = Path("/var/www/ai-training/pretrained_models") / model_id
+            info["is_cached"] = cache_path.exists()
+            if cache_path.exists():
+                info["cache_path"] = str(cache_path)
+            
+            return info
+    
+    raise HTTPException(status_code=404, detail="模型不存在")
 
 
 if __name__ == "__main__":

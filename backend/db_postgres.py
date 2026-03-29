@@ -334,6 +334,76 @@ def init_database_tables():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- A/B 测试实验表
+    CREATE TABLE IF NOT EXISTS ab_tests (
+        id VARCHAR(64) PRIMARY KEY,
+        project_id VARCHAR(64) REFERENCES projects(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        
+        -- 参与对比的模型
+        model_a_id VARCHAR(64) NOT NULL, -- 控制组 (原模型)
+        model_b_id VARCHAR(64) NOT NULL, -- 实验组 (新模型)
+        
+        -- 流量分配配置
+        traffic_split_a INTEGER DEFAULT 50, -- 模型A流量占比 (0-100)
+        traffic_split_b INTEGER DEFAULT 50, -- 模型B流量占比 (0-100)
+        
+        -- 状态
+        status VARCHAR(50) DEFAULT 'running', -- 'running', 'paused', 'completed', 'cancelled'
+        
+        -- 成功指标
+        primary_metric VARCHAR(50) DEFAULT 'accuracy', -- 主要评估指标
+        min_sample_size INTEGER DEFAULT 100, -- 最小样本数才判定显著性
+        
+        -- 统计结果
+        model_a_calls INTEGER DEFAULT 0,
+        model_b_calls INTEGER DEFAULT 0,
+        model_a_success INTEGER DEFAULT 0,
+        model_b_success INTEGER DEFAULT 0,
+        model_a_avg_latency FLOAT,
+        model_b_avg_latency FLOAT,
+        
+        -- 结论
+        winner_model VARCHAR(64), -- 'model_a', 'model_b', 'tie', null
+        confidence_level FLOAT, -- 置信度 (如 0.95)
+        improvement_percent FLOAT, -- 提升百分比
+        
+        started_at TIMESTAMP,
+        ended_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- A/B 测试调用记录表
+    CREATE TABLE IF NOT EXISTS ab_test_calls (
+        id SERIAL PRIMARY KEY,
+        test_id VARCHAR(64) REFERENCES ab_tests(id) ON DELETE CASCADE,
+        variant VARCHAR(10) NOT NULL, -- 'A' or 'B'
+        model_id VARCHAR(64) NOT NULL,
+        
+        -- 请求数据
+        input_data JSONB,
+        output_data JSONB,
+        prediction_correct BOOLEAN, -- 如果有反馈
+        
+        -- 性能指标
+        latency_ms INTEGER,
+        success BOOLEAN DEFAULT TRUE,
+        error_message TEXT,
+        
+        -- 用户/会话标识（用于确保同一用户始终分配到同一组）
+        user_id VARCHAR(255),
+        session_id VARCHAR(255),
+        
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- 创建索引
+    CREATE INDEX IF NOT EXISTS idx_ab_tests_project ON ab_tests(project_id);
+    CREATE INDEX IF NOT EXISTS idx_ab_tests_status ON ab_tests(status);
+    CREATE INDEX IF NOT EXISTS idx_ab_test_calls_test ON ab_test_calls(test_id);
+    CREATE INDEX IF NOT EXISTS idx_ab_test_calls_variant ON ab_test_calls(test_id, variant);
+    
     -- 推理服务告警记录表
     CREATE TABLE IF NOT EXISTS inference_alerts (
         id SERIAL PRIMARY KEY,
