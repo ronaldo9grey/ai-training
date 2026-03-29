@@ -30,6 +30,12 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 设置 HuggingFace 镜像（国内加速）
+import os
+if not os.environ.get('HF_ENDPOINT'):
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    logger.info("使用 HuggingFace 镜像: https://hf-mirror.com")
+
 # 检查设备
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"使用设备: {device}")

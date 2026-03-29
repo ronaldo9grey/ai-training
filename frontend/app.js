@@ -274,6 +274,342 @@ const TASK_TYPES = {
   object_detection: { name: '目标检测', icon: '🎯', desc: '检测图片中物体位置，如缺陷定位、计数' }
 };
 
+// 创建示例项目按钮
+function DemoProjectButton({ onCreated }) {
+  const [creating, setCreating] = useState(false);
+
+  const createDemo = async () => {
+    setCreating(true);
+    try {
+      const res = await fetch(`${API_BASE}/demo/create`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert(`示例项目创建成功！\\n${data.message}\\n共${data.stats.total_samples}条数据`);
+        onCreated();
+      } else {
+        alert('创建失败: ' + (data.error || '未知错误'));
+      }
+    } catch (e) {
+      alert('创建失败: ' + e.message);
+    }
+    setCreating(false);
+  };
+
+  return (
+    <button
+      onClick={createDemo}
+      disabled={creating}
+      className="px-4 py-2 bg-gradient-to-r from-amber-400 to-orange-500 text-white rounded-xl font-medium hover:shadow-lg transition-all flex items-center gap-2 disabled:opacity-50"
+    >
+      {creating ? <Icons.Loading /> : <Icons.Sparkles />}
+      {creating ? '创建中...' : '一键体验'}
+    </button>
+  );
+}
+
+// 模型对比弹窗
+function ModelComparisonModal({ projectId, modelIds, onClose }) {
+  const [comparisonData, setComparisonData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('overview'); // overview, curves, config
+  
+  useEffect(() => {
+    loadComparison();
+  }, []);
+  
+  const loadComparison = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/models/compare?job_ids=${modelIds.join(',')}`);
+      const data = await res.json();
+      setComparisonData(data);
+    } catch (e) {
+      console.error('加载对比数据失败:', e);
+    }
+    setLoading(false);
+  };
+  
+  if (loading) return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-2xl p-8">
+        <Icons.Loading /> 加载对比数据...
+      </div>
+    </div>
+  );
+  
+  if (!comparisonData) return null;
+  
+  const { models, curves, rankings } = comparisonData;
+  
+  // 绘制训练曲线（简化版SVG）
+  const renderCurve = (metricKey, title, colorKey) => {
+    const height = 200;
+    const width = 600;
+    const padding = 40;
+    
+    // 找出所有模型的最大epoch和最大value
+    let maxEpoch = 0;
+    let maxValue = 0;
+    let minValue = Infinity;
+    
+    Object.values(curves).forEach(curve => {
+      const values = curve[metricKey].filter(v => v !== null);
+      if (values.length > 0) {
+        maxValue = Math.max(maxValue, ...values);
+        minValue = Math.min(minValue, ...values);
+        maxEpoch = Math.max(maxEpoch, curve.epochs.length);
+      }
+    });
+    
+    if (maxEpoch === 0) return <div className="text-gray-500">暂无数据</div>;
+    
+    const range = maxValue - minValue || 1;
+    
+    return (
+      <div className="mb-6">
+        <h4 className="font-medium text-gray-800 mb-3">{title}</h4>
+        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-48 bg-gray-50 rounded-lg">
+          {/* 坐标轴 */}
+          <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="#ccc" />
+          <line x1={padding} y1={padding} x2={padding} y2={height - padding} stroke="#ccc" />
+          
+          {/* 网格线 */}
+          {[0, 0.25, 0.5, 0.75, 1].map(t => (
+            <g key={t}>
+              <line 
+                x1={padding} 
+                y1={height - padding - t * (height - 2 * padding)}
+                x2={width - padding}
+                y2={height - padding - t * (height - 2 * padding)}
+                stroke="#eee"
+                strokeDasharray="2,2"
+              />
+              <text 
+                x={padding - 5} 
+                y={height - padding - t * (height - 2 * padding) + 4}
+                fontSize="10"
+                fill="#999"
+                textAnchor="end"
+              >
+                {(minValue + t * range).toFixed(3)}
+              </text>
+            </g>
+          ))}
+          
+          {/* 曲线 */}
+          {models.map((model, idx) => {
+            const curve = curves[model.id];
+            if (!curve || curve.epochs.length === 0) return null;
+            
+            const points = curve.epochs.map((epoch, i) => {
+              const value = curve[metricKey][i];
+              if (value === null) return null;
+              const x = padding + (epoch / maxEpoch) * (width - 2 * padding);
+              const y = height - padding - ((value - minValue) / range) * (height - 2 * padding);
+              return `${x},${y}`;
+            }).filter(p => p !== null).join(' ');
+            
+            return (
+              <polyline
+                key={model.id}
+                points={points}
+                fill="none"
+                stroke={model.color}
+                strokeWidth="2"
+              />
+            );
+          })}
+          
+          {/* 图例 */}
+          {models.map((model, idx) => (
+            <g key={model.id} transform={`translate(${width - 150}, ${20 + idx * 20})`}>
+              <line x1="0" y1="0" x2="20" y2="0" stroke={model.color} strokeWidth="2" />
+              <text x="25" y="4" fontSize="10" fill="#666">{model.short_id}</text>
+            </g>
+          ))}
+        </svg>
+      </div>
+    );
+  };
+  
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl max-w-5xl w-full max-h-[90vh] overflow-auto">
+        <div className="sticky top-0 bg-white border-b p-4 flex items-center justify-between">
+          <div>
+            <h3 className="font-semibold text-lg">模型版本对比</h3>
+            <p className="text-sm text-gray-500">对比 {models.length} 个模型的训练结果</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <Icons.Close />
+          </button>
+        </div>
+        
+        <div className="p-4">
+          {/* 标签切换 */}
+          <div className="flex gap-2 mb-6">
+            {[
+              {key: 'overview', label: '概览对比'},
+              {key: 'curves', label: '训练曲线'},
+              {key: 'config', label: '配置对比'}
+            ].map(tab => (
+              <button
+                key={tab.key}
+                onClick={() => setActiveTab(tab.key)}
+                className={`px-4 py-2 rounded-lg font-medium ${
+                  activeTab === tab.key 
+                    ? 'bg-purple-600 text-white' 
+                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          
+          {/* 概览对比 */}
+          {activeTab === 'overview' && (
+            <div className="space-y-6">
+              {/* 冠军榜 */}
+              {rankings && (rankings.best_accuracy || rankings.lowest_loss) && (
+                <div className="grid grid-cols-3 gap-4">
+                  {rankings.best_accuracy && (
+                    <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4">
+                      <div className="text-yellow-600 text-sm mb-1">🏆 最高准确率</div>
+                      <div className="font-bold text-gray-800">{(rankings.best_accuracy.value * 100).toFixed(2)}%</div>
+                      <div className="text-xs text-gray-500">{rankings.best_accuracy.model_id.slice(0, 8)}</div>
+                    </div>
+                  )}
+                  {rankings.lowest_loss && (
+                    <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
+                      <div className="text-blue-600 text-sm mb-1">📉 最低验证损失</div>
+                      <div className="font-bold text-gray-800">{rankings.lowest_loss.value.toFixed(4)}</div>
+                      <div className="text-xs text-gray-500">{rankings.lowest_loss.model_id.slice(0, 8)}</div>
+                    </div>
+                  )}
+                  {rankings.fastest_convergence && (
+                    <div className="bg-green-50 border border-green-200 rounded-xl p-4">
+                      <div className="text-green-600 text-sm mb-1">⚡ 最快收敛</div>
+                      <div className="font-bold text-gray-800">{rankings.fastest_convergence.epochs} 轮</div>
+                      <div className="text-xs text-gray-500">{rankings.fastest_convergence.model_id.slice(0, 8)}</div>
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              {/* 指标对比表 */}
+              <div className="bg-gray-50 rounded-xl overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-100">
+                    <tr>
+                      <th className="px-4 py-3 text-left">模型</th>
+                      <th className="px-4 py-3 text-center">准确率</th>
+                      <th className="px-4 py-3 text-center">验证损失</th>
+                      <th className="px-4 py-3 text-center">训练轮数</th>
+                      <th className="px-4 py-3 text-center">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {models.map(model => (
+                      <tr key={model.id} className="border-t border-gray-200">
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="w-3 h-3 rounded-full" style={{backgroundColor: model.color}} />
+                            <div>
+                              <div className="font-medium text-gray-800">{model.name}</div>
+                              <div className="text-xs text-gray-500">{model.short_id}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          {model.metrics.best_accuracy 
+                            ? <span className="font-mono font-medium">{(model.metrics.best_accuracy * 100).toFixed(2)}%</span>
+                            : '-'
+                          }
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          {model.metrics.best_val_loss
+                            ? <span className="font-mono">{model.metrics.best_val_loss.toFixed(4)}</span>
+                            : '-'
+                          }
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          {model.metrics.epochs_trained}/{model.metrics.total_epochs}
+                          {model.metrics.early_stopped && (
+                            <span className="ml-1 text-xs text-amber-600">(早停)</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          <span className={`px-2 py-1 rounded text-xs ${
+                            model.status === 'completed' ? 'bg-green-100 text-green-700' :
+                            model.status === 'training' ? 'bg-blue-100 text-blue-700' :
+                            'bg-red-100 text-red-700'
+                          }`}>
+                            {model.status === 'completed' ? '完成' : 
+                             model.status === 'training' ? '训练中' : '失败'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          
+          {/* 训练曲线 */}
+          {activeTab === 'curves' && (
+            <div>
+              {renderCurve('train_loss', '训练损失', 'train_loss')}
+              {renderCurve('val_loss', '验证损失', 'val_loss')}
+              {renderCurve('train_acc', '训练准确率', 'train_acc')}
+              {renderCurve('val_acc', '验证准确率', 'val_acc')}
+            </div>
+          )}
+          
+          {/* 配置对比 */}
+          {activeTab === 'config' && (
+            <div className="bg-gray-50 rounded-xl overflow-hidden">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-100">
+                  <tr>
+                    <th className="px-4 py-3 text-left">配置项</th>
+                    {models.map(m => (
+                      <th key={m.id} className="px-4 py-3 text-center">
+                        <div className="flex items-center justify-center gap-1">
+                          <div className="w-2 h-2 rounded-full" style={{backgroundColor: m.color}} />
+                          <span className="text-xs">{m.short_id}</span>
+                        </div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    {key: 'model_name', label: '模型名称'},
+                    {key: 'epochs', label: '训练轮数'},
+                    {key: 'batch_size', label: '批次大小'},
+                    {key: 'learning_rate', label: '学习率'},
+                    {key: 'max_length', label: '最大长度'}
+                  ].map(({key, label}) => (
+                    <tr key={key} className="border-t border-gray-200">
+                      <td className="px-4 py-3 font-medium text-gray-700">{label}</td>
+                      {models.map(m => (
+                        <td key={m.id} className="px-4 py-3 text-center font-mono text-gray-600">
+                          {m.config[key] !== undefined ? String(m.config[key]) : '-'}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ProjectList({ projects, onRefresh, onSelect }) {
   const [showCreate, setShowCreate] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -311,12 +647,15 @@ function ProjectList({ projects, onRefresh, onSelect }) {
           <h2 className="text-2xl font-bold text-gray-800">训练项目</h2>
           <p className="text-gray-500 mt-1">管理您的AI模型训练项目</p>
         </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="px-4 py-2 bg-gradient-to-r from-cyan-500 to-purple-600 text-white rounded-xl font-medium hover:shadow-lg transition-all flex items-center gap-2"
-        >
-          <Icons.Plus /> 新建项目
-        </button>
+        <div className="flex gap-3">
+          <DemoProjectButton onCreated={onRefresh} />
+          <button
+            onClick={() => setShowCreate(true)}
+            className="px-4 py-2 bg-gradient-to-r from-cyan-500 to-purple-600 text-white rounded-xl font-medium hover:shadow-lg transition-all flex items-center gap-2"
+          >
+            <Icons.Plus /> 新建项目
+          </button>
+        </div>
       </div>
 
       {showCreate && (
@@ -3181,6 +3520,7 @@ function DeployTab({ projectId, jobs, datasets, projectType }) {
     config: '{}'
   });
   const [selectedModels, setSelectedModels] = useState([]);
+  const [showComparison, setShowComparison] = useState(false);
 
   // 加载模型版本列表
   const loadModels = async () => {
@@ -3479,18 +3819,37 @@ function DeployTab({ projectId, jobs, datasets, projectType }) {
               {selectedModels.length >= 2 && (
                 <div className="p-4 bg-blue-50 rounded-xl">
                   <button
-                    onClick={async () => {
-                      const res = await fetch(`${API_BASE}/projects/${projectId}/models/compare?model_ids=${selectedModels.join(',')}`);
-                      const data = await res.json();
-                      // 显示对比结果
-                      alert(`已选择 ${selectedModels.length} 个模型进行对比，详细对比功能待完善`);
-                    }}
-                    className="w-full py-2 bg-blue-500 text-white rounded-lg font-medium"
+                    onClick={() => setShowComparison(true)}
+                    className="w-full py-2 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600"
                   >
                     <Icons.Compare /> 对比选中的 {selectedModels.length} 个模型
                   </button>
                 </div>
               )}
+              
+              {showComparison && (
+                <ModelComparisonModal
+                  projectId={projectId}
+                  modelIds={selectedModels}
+                  onClose={() => setShowComparison(false)}
+                />
+              )}
+              
+              {/* AutoML可视化入口 - 放在版本管理底部 */}
+              <div className="mt-6 p-4 bg-gradient-to-r from-orange-50 to-amber-50 rounded-xl border border-orange-200">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-semibold text-gray-800">AutoML 超参搜索可视化</div>
+                    <div className="text-sm text-gray-500">查看超参数与模型性能的关系</div>
+                  </div>
+                  <button
+                    onClick={() => window.open(`${API_BASE}/automl/experiments`, '_blank')}
+                    className="px-4 py-2 bg-orange-500 text-white rounded-lg text-sm font-medium hover:bg-orange-600"
+                  >
+                    查看实验
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -4025,7 +4384,8 @@ function TrainingDetailModal({ projectId, job, onClose }) {
   };
   
   const connectWebSocket = () => {
-    const wsUrl = `ws://${window.location.host}/ai-training/ws/training/${job.id}`;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ai-training/ws/training/${job.id}`;
     const ws = new WebSocket(wsUrl);
     
     ws.onopen = () => {
@@ -4035,9 +4395,25 @@ function TrainingDetailModal({ projectId, job, onClose }) {
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === 'training_update') {
-        // 刷新指标
+        // 实时更新任务状态（不等待API刷新）
+        setMetrics(prev => [...prev, {
+          epoch: data.epoch,
+          loss: data.loss,
+          val_loss: data.val_loss,
+          learning_rate: data.learning_rate,
+          timestamp: data.timestamp
+        }]);
+        // 同时刷新完整指标
         loadMetrics();
+      } else if (data.type === 'init') {
+        // 初始状态，可选处理
+        console.log('WebSocket init:', data);
       }
+    };
+    
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setWsStatus('error');
     };
     
     ws.onclose = () => {

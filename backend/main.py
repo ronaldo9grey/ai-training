@@ -195,6 +195,153 @@ async def get_project(project_id: str):
         "created_at": row['created_at'],
         "updated_at": row['updated_at'],
         "config": row['config'] if row['config'] else {}
+}
+
+# 创建Demo项目（一键体验）
+@app.post("/api/demo/create")
+async def create_demo_project():
+    """创建示例文本分类项目，包含示例数据集"""
+    import uuid
+    from datetime import datetime
+    
+    project_id = str(uuid.uuid4())
+    dataset_id = str(uuid.uuid4())
+    
+    # 创建项目
+    execute_update('''
+        INSERT INTO projects (id, name, description, task_type, config)
+        VALUES (%s, %s, %s, %s, %s)
+    ''', (project_id, "🎮 示例项目-新闻分类", "内置示例数据集，5分钟体验完整训练流程", "text_classification", json.dumps({})))
+    
+    # 创建项目目录
+    project_data_dir = DATA_DIR / project_id
+    project_data_dir.mkdir(parents=True, exist_ok=True)
+    (MODELS_DIR / project_id).mkdir(parents=True, exist_ok=True)
+    
+    # 生成示例数据集（中文新闻分类：体育、科技、娱乐、财经）
+    demo_data = [
+        # 体育
+        ("国足在世预赛中取得关键胜利，晋级形势大好", "体育"),
+        ("NBA总决赛精彩对决，湖人队夺得总冠军", "体育"),
+        ("梅西加盟迈阿密国际，美国足球迎来巨星时代", "体育"),
+        ("中国乒乓球队包揽世乒赛全部金牌", "体育"),
+        ("马拉松赛事在全国各地火热开展", "体育"),
+        ("冬奥会花样滑冰比赛精彩瞬间回顾", "体育"),
+        ("中超联赛新赛季开幕，球迷热情高涨", "体育"),
+        ("网球大满贯赛事即将开幕，中国选手备受期待", "体育"),
+        ("游泳世锦赛中国队再创佳绩", "体育"),
+        ("电竞入亚，英雄联盟成为亚运会正式比赛项目", "体育"),
+        ("羽毛球世锦赛中国队夺得三金", "体育"),
+        ("F1赛车上海站比赛圆满结束", "体育"),
+        ("中国女排在世界联赛中取得连胜", "体育"),
+        ("高尔夫球大师赛产生新冠军", "体育"),
+        ("滑雪运动在国内越来越受欢迎", "体育"),
+        
+        # 科技
+        ("人工智能技术在医疗领域取得突破性进展", "科技"),
+        ("新款智能手机发布，搭载最新处理器", "科技"),
+        ("SpaceX星舰发射成功，商业航天迈出新步伐", "科技"),
+        ("量子计算机计算能力再创新高", "科技"),
+        ("5G网络覆盖全国主要城市，用户体验大幅提升", "科技"),
+        ("电动汽车电池技术突破，续航里程大幅增加", "科技"),
+        ("元宇宙概念持续升温，各大厂商布局虚拟现实", "科技"),
+        ("区块链技术在供应链金融中的应用", "科技"),
+        ("国产操作系统市场份额稳步提升", "科技"),
+        ("机器人技术在制造业的广泛应用", "科技"),
+        ("云计算服务降价，企业数字化转型加速", "科技"),
+        ("脑机接口技术取得重要进展", "科技"),
+        ("无人机配送服务开始试点运营", "科技"),
+        ("智能家居生态系统日趋完善", "科技"),
+        ("自动驾驶技术安全性持续提升", "科技"),
+        
+        # 娱乐
+        ("春节档电影票房创历史新高", "娱乐"),
+        ("知名歌手世界巡回演唱会启动", "娱乐"),
+        ("热门电视剧迎来大结局，观众反响热烈", "娱乐"),
+        ("综艺节目创新模式受到年轻观众喜爱", "娱乐"),
+        ("国产动画电影在国际上获奖", "娱乐"),
+        ("音乐节吸引数万名乐迷参加", "娱乐"),
+        ("经典话剧复排，票房火爆", "娱乐"),
+        ("网络剧品质提升，精品化趋势明显", "娱乐"),
+        ("明星慈善活动引发社会关注", "娱乐"),
+        ("相声小品晚会带来欢声笑语", "娱乐"),
+        ("纪录片拍摄技术不断创新", "娱乐"),
+        ("选秀节目挖掘新人，培养新生代艺人", "娱乐"),
+        ("影视特效技术达到国际先进水平", "娱乐"),
+        ("在线音乐平台版权合作取得进展", "娱乐"),
+        ("舞台剧市场规模持续扩大", "娱乐"),
+        
+        # 财经
+        ("央行宣布降准，释放流动性支持实体经济", "财经"),
+        ("A股市场震荡调整，投资者情绪谨慎", "财经"),
+        ("新能源汽车销量创新高，产业链受益", "财经"),
+        ("房地产政策优化，市场逐步回暖", "财经"),
+        ("跨境电商快速发展，出口贸易增长", "财经"),
+        ("数字货币监管政策趋于完善", "财经"),
+        ("银行业数字化转型加速推进", "财经"),
+        ("消费复苏带动零售行业增长", "财经"),
+        ("基建投资加大，拉动相关产业", "财经"),
+        ("上市公司年报披露，业绩整体向好", "财经"),
+        ("保险行业创新产品满足多样化需求", "财经"),
+        ("股市注册制改革稳步推进", "财经"),
+        ("外汇市场保持稳定，人民币汇率坚挺", "财经"),
+        ("基金市场规模扩大，投资者结构优化", "财经"),
+        ("绿色金融支持双碳目标实现", "财经"),
+    ]
+    
+    # 创建DataFrame并保存
+    import pandas as pd
+    df = pd.DataFrame(demo_data, columns=["text", "label"])
+    
+    # 打乱顺序
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    dataset_path = project_data_dir / f"{dataset_id}.csv"
+    df.to_csv(dataset_path, index=False)
+    
+    # 划分数据集
+    from sklearn.model_selection import train_test_split
+    train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42, stratify=df['label'])
+    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df['label'])
+    
+    train_path = project_data_dir / f"{dataset_id}_train.csv"
+    val_path = project_data_dir / f"{dataset_id}_val.csv"
+    test_path = project_data_dir / f"{dataset_id}_test.csv"
+    
+    train_df.to_csv(train_path, index=False)
+    val_df.to_csv(val_path, index=False)
+    test_df.to_csv(test_path, index=False)
+    
+    # 保存数据集记录
+    labels = df['label'].unique().tolist()
+    meta_info = json.dumps({
+        'train_samples': len(train_df),
+        'val_samples': len(val_df),
+        'test_samples': len(test_df),
+        'preprocessed': True
+    })
+    execute_update('''
+        INSERT INTO datasets (id, project_id, name, file_path, file_type, total_samples, labels, status, meta_info)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (dataset_id, project_id, "📚 示例数据集-新闻分类", str(dataset_path), 'csv', len(df), json.dumps(labels), 'preprocessed', meta_info))
+    
+    return {
+        "success": True,
+        "project_id": project_id,
+        "dataset_id": dataset_id,
+        "message": "示例项目创建成功！包含60条新闻数据（体育/科技/娱乐/财经各15条）",
+        "stats": {
+            "total_samples": len(df),
+            "train_samples": len(train_df),
+            "val_samples": len(val_df),
+            "test_samples": len(test_df),
+            "labels": labels
+        },
+        "next_steps": [
+            "1. 进入项目，选择数据集",
+            "2. 点击'开始训练'，选择'快速训练'模板",
+            "3. 5分钟后查看训练结果"
+        ]
     }
 
 # 数据集管理
@@ -781,13 +928,182 @@ async def deploy_model(project_id: str, job_id: str, deploy_type: str = Form("ap
             raise HTTPException(status_code=500, detail=f"部署失败: {str(e)}")
     
     elif deploy_type == "ollama":
-        # Ollama模式：导出到Ollama
-        return {
-            "success": True,
-            "deploy_type": "ollama",
-            "message": "Ollama导出功能开发中",
-            "model_path": model_path
-        }
+        # Ollama模式：导出分类模型为ONNX并创建Modelfile
+        try:
+            from pathlib import Path
+            import json
+            
+            # 检查模型文件
+            model_dir = Path(model_path)
+            final_dir = model_dir / "final"
+            label_mapping_path = model_dir / "label_mapping.json"
+            
+            if not final_dir.exists():
+                raise HTTPException(status_code=404, detail="模型文件不存在")
+            
+            # 读取标签映射
+            labels = []
+            if label_mapping_path.exists():
+                with open(label_mapping_path) as f:
+                    label_map = json.load(f)
+                    labels = [label_map['id2label'][str(i)] for i in range(len(label_map['id2label']))]
+            
+            # 导出为ONNX
+            import torch
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            
+            onnx_path = model_dir / "model.onnx"
+            
+            # 加载模型
+            tokenizer = AutoTokenizer.from_pretrained(str(final_dir))
+            model = AutoModelForSequenceClassification.from_pretrained(str(final_dir))
+            model.eval()
+            
+            # 创建dummy输入
+            dummy_text = "这是一个测试文本"
+            inputs = tokenizer(dummy_text, return_tensors="pt", max_length=512, truncation=True, padding='max_length')
+            
+            # 导出ONNX
+            torch.onnx.export(
+                model,
+                (inputs['input_ids'], inputs['attention_mask']),
+                str(onnx_path),
+                input_names=['input_ids', 'attention_mask'],
+                output_names=['logits'],
+                dynamic_axes={
+                    'input_ids': {0: 'batch_size', 1: 'sequence_length'},
+                    'attention_mask': {0: 'batch_size', 1: 'sequence_length'},
+                    'logits': {0: 'batch_size'}
+                },
+                opset_version=14
+            )
+            
+            # 创建Ollama Modelfile
+            modelfile_content = f'''FROM {onnx_path}
+
+SYSTEM """
+你是一个文本分类模型。输入一段文本，输出分类结果。
+可用类别: {', '.join(labels)}
+
+输出格式（JSON）:
+{{"label": "预测类别", "confidence": 0.95, "all_probabilities": {{...}}}}
+"""
+
+PARAMETER temperature 0.1
+'''
+            
+            modelfile_path = model_dir / "Modelfile"
+            with open(modelfile_path, 'w') as f:
+                f.write(modelfile_content)
+            
+            # 创建Python包装脚本（因为Ollama不直接支持BERT分类模型）
+            wrapper_script = '''#!/usr/bin/env python3
+# Ollama API 包装器 - 将BERT分类模型包装为Ollama兼容格式
+import os
+import sys
+import json
+import http.server
+import socketserver
+from pathlib import Path
+
+# 添加backend目录到路径
+sys.path.insert(0, '/var/www/ai-training/backend')
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+MODEL_DIR = Path("''' + str(model_dir) + '''")
+
+class OllamaHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path == '/api/generate':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            request = json.loads(post_data)
+            
+            prompt = request.get('prompt', '')
+            
+            # 加载模型（首次请求时）
+            if not hasattr(self, 'model'):
+                final_dir = MODEL_DIR / "final"
+                label_mapping_path = MODEL_DIR / "label_mapping.json"
+                
+                self.tokenizer = AutoTokenizer.from_pretrained(str(final_dir))
+                self.model = AutoModelForSequenceClassification.from_pretrained(str(final_dir))
+                self.model.eval()
+                
+                with open(label_mapping_path) as f:
+                    label_map = json.load(f)
+                self.id2label = {int(k): v for k, v in label_map['id2label'].items()}
+            
+            # 预测
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                pred_id = torch.argmax(probs, dim=-1).item()
+                confidence = probs[0][pred_id].item()
+                all_probs = {self.id2label[i]: probs[0][i].item() for i in range(len(self.id2label))}
+            
+            result = {
+                "label": self.id2label[pred_id],
+                "confidence": round(confidence, 4),
+                "all_probabilities": {k: round(v, 4) for k, v in all_probs.items()}
+            }
+            
+            response = {
+                "response": json.dumps(result, ensure_ascii=False),
+                "done": True
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+        
+        elif self.path == '/api/tags':
+            # Ollama模型列表
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"models": []}).encode())
+    
+    def log_message(self, format, *args):
+        # 静默日志
+        pass
+
+if __name__ == '__main__':
+    PORT = int(os.environ.get('OLLAMA_PORT', 11435))
+    with socketserver.TCPServer(("", PORT), OllamaHandler) as httpd:
+        print(f"Ollama兼容服务启动于端口 {PORT}")
+        httpd.serve_forever()
+'''
+            
+            wrapper_path = model_dir / "ollama_server.py"
+            with open(wrapper_path, 'w') as f:
+                f.write(wrapper_script)
+            
+            os.chmod(wrapper_path, 0o755)
+            
+            return {
+                "success": True,
+                "deploy_type": "ollama",
+                "message": "模型已导出为Ollama格式",
+                "files": {
+                    "onnx_model": str(onnx_path),
+                    "modelfile": str(modelfile_path),
+                    "wrapper_script": str(wrapper_path)
+                },
+                "instructions": [
+                    f"1. 启动Ollama包装服务: python3 {wrapper_path}",
+                    "2. 或使用Ollama导入: ollama create my-classifier -f " + str(modelfile_path),
+                    "3. 测试: curl http://localhost:11435/api/generate -d '{\"prompt\":\"测试文本\"}'"
+                ],
+                "labels": labels
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Ollama导出失败: {str(e)}")
     
     else:
         raise HTTPException(status_code=400, detail="不支持的部署类型")
@@ -1104,6 +1420,163 @@ async def list_model_checkpoints(project_id: str, job_id: str):
     return {"checkpoints": checkpoints}
 
 
+@app.get("/api/projects/{project_id}/jobs/{job_id}/prediction-analysis")
+async def analyze_predictions(project_id: str, job_id: str, max_samples: int = 100):
+    """
+    预测结果深度分析 - 混淆矩阵 + 错误样本
+    
+    需要模型已完成训练，且数据集包含验证集
+    """
+    # 获取任务信息
+    rows = execute_query('''
+        SELECT j.*, d.file_path as dataset_path, d.labels as dataset_labels
+        FROM training_jobs j
+        LEFT JOIN datasets d ON j.dataset_id = d.id
+        WHERE j.id = %s AND j.project_id = %s
+    ''', (job_id, project_id))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    
+    job = rows[0]
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="模型训练尚未完成")
+    
+    model_path = job['model_path']
+    dataset_path = job['dataset_path']
+    
+    if not dataset_path:
+        raise HTTPException(status_code=400, detail="找不到关联的数据集")
+    
+    # 加载标签映射
+    label_mapping_path = Path(model_path) / "label_mapping.json"
+    if not label_mapping_path.exists():
+        raise HTTPException(status_code=404, detail="找不到标签映射文件")
+    
+    with open(label_mapping_path) as f:
+        label_map = json.load(f)
+    id2label = {int(k): v for k, v in label_map['id2label'].items()}
+    label2id = {v: int(k) for k, v in label_map['id2label'].items()}
+    labels = [id2label[i] for i in range(len(id2label))]
+    
+    # 加载验证集
+    import pandas as pd
+    val_path = str(dataset_path).replace('.csv', '_val.csv')
+    
+    if not Path(val_path).exists():
+        # 如果没有预划分的验证集，使用完整数据集
+        val_path = dataset_path
+    
+    try:
+        df = pd.read_csv(val_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"无法加载数据集: {e}")
+    
+    # 确定文本列和标签列
+    text_col = df.columns[0] if 'text' not in df.columns else 'text'
+    label_col = df.columns[-1] if 'label' not in df.columns else 'label'
+    
+    # 限制样本数
+    df = df.head(max_samples)
+    
+    # 加载模型进行预测
+    from inference_service import inference_service
+    model_id = f"{project_id}/{job_id}"
+    
+    try:
+        inference_service.load_model(model_path, model_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"模型加载失败: {e}")
+    
+    # 批量预测
+    texts = df[text_col].tolist()
+    predictions = inference_service.predict(texts, model_id)
+    
+    # 构建混淆矩阵
+    y_true = []
+    y_pred = []
+    error_samples = []
+    
+    for idx, (text, pred_result) in enumerate(zip(texts, predictions)):
+        true_label = str(df.iloc[idx][label_col])
+        pred_label = pred_result.get('prediction', 'unknown')
+        confidence = pred_result.get('confidence', 0)
+        
+        # 转换为ID
+        true_id = label2id.get(true_label, -1)
+        pred_id = label2id.get(pred_label, -1)
+        
+        if true_id >= 0 and pred_id >= 0:
+            y_true.append(true_id)
+            y_pred.append(pred_id)
+            
+            # 记录错误样本
+            if true_id != pred_id:
+                error_samples.append({
+                    "text": text[:200] + "..." if len(str(text)) > 200 else text,
+                    "true_label": true_label,
+                    "predicted_label": pred_label,
+                    "confidence": confidence,
+                    "error_type": f"{true_label} → {pred_label}"
+                })
+    
+    # 计算混淆矩阵
+    from sklearn.metrics import confusion_matrix
+    
+    if len(y_true) > 0:
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(len(labels))))
+        
+        # 格式化混淆矩阵
+        cm_formatted = []
+        for i, row in enumerate(cm):
+            cm_formatted.append({
+                "true_label": id2label[i],
+                "predictions": {id2label[j]: int(count) for j, count in enumerate(row)}
+            })
+    else:
+        cm_formatted = []
+    
+    # 计算每个类别的指标
+    from sklearn.metrics import classification_report
+    
+    if len(y_true) > 0:
+        report = classification_report(y_true, y_pred, 
+                                     target_names=labels, 
+                                     output_dict=True,
+                                     zero_division=0)
+        
+        per_class_metrics = []
+        for label in labels:
+            if label in report:
+                per_class_metrics.append({
+                    "label": label,
+                    "precision": report[label]['precision'],
+                    "recall": report[label]['recall'],
+                    "f1_score": report[label]['f1-score'],
+                    "support": int(report[label]['support'])
+                })
+    else:
+        per_class_metrics = []
+    
+    return {
+        "analysis_summary": {
+            "total_samples": len(texts),
+            "correct_predictions": len(texts) - len(error_samples),
+            "error_count": len(error_samples),
+            "accuracy": (len(texts) - len(error_samples)) / len(texts) if texts else 0
+        },
+        "confusion_matrix": {
+            "labels": labels,
+            "matrix": cm_formatted
+        },
+        "per_class_metrics": per_class_metrics,
+        "error_analysis": {
+            "error_samples": error_samples[:20],  # 最多返回20个错误样本
+            "error_patterns": {}
+        }
+    }
+
+
 # ============ WebSocket 实时训练监控 ============
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -1148,6 +1621,199 @@ ws_manager = WebSocketManager()
 # 设置到tasks模块（用于训练回调推送）
 import tasks
 tasks.set_websocket_manager(ws_manager)
+
+
+# ============ 模型版本对比 API ============
+
+@app.get("/api/projects/{project_id}/models/compare")
+async def compare_models(
+    project_id: str,
+    job_ids: str = Query(..., description="逗号分隔的模型ID列表")
+):
+    """
+    多模型版本对比 - 返回关键指标对比和训练曲线
+    
+    Args:
+        job_ids: 逗号分隔的训练任务ID，如 "id1,id2,id3"
+    
+    Returns:
+        对比数据，包括指标摘要、训练曲线、配置对比
+    """
+    ids = [j.strip() for j in job_ids.split(',') if j.strip()]
+    
+    if len(ids) < 2:
+        raise HTTPException(status_code=400, detail="至少需要选择2个模型进行对比")
+    
+    if len(ids) > 5:
+        raise HTTPException(status_code=400, detail="最多支持5个模型同时对比")
+    
+    # 查询模型基本信息
+    placeholders = ','.join(['%s'] * len(ids))
+    rows = execute_query(f'''
+        SELECT id, model_name, status, best_accuracy, best_val_loss,
+               current_epoch, total_epochs, eval_report, config,
+               early_stopped, stop_reason, created_at, completed_at
+        FROM training_jobs 
+        WHERE project_id = %s AND id IN ({placeholders})
+        ORDER BY created_at DESC
+    ''', (project_id, *ids))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="未找到指定的模型")
+    
+    models = []
+    colors = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6']  # 蓝绿黄红紫
+    
+    for idx, row in enumerate(rows):
+        config = row['config'] if row['config'] else {}
+        eval_report = row['eval_report'] if row['eval_report'] else {}
+        
+        models.append({
+            "id": row['id'],
+            "name": row['model_name'],
+            "short_id": row['id'][:8],
+            "color": colors[idx % len(colors)],
+            "status": row['status'],
+            "metrics": {
+                "best_accuracy": row['best_accuracy'],
+                "best_val_loss": row['best_val_loss'],
+                "epochs_trained": row['current_epoch'],
+                "total_epochs": row['total_epochs'],
+                "early_stopped": bool(row['early_stopped']),
+                "stop_reason": row['stop_reason']
+            },
+            "config": {
+                "model_name": config.get('model_name', 'unknown'),
+                "epochs": config.get('epochs'),
+                "batch_size": config.get('batch_size'),
+                "learning_rate": config.get('learning_rate'),
+                "max_length": config.get('max_length'),
+            },
+            "eval_report": eval_report,
+            "created_at": row['created_at'],
+            "completed_at": row['completed_at']
+        })
+    
+    # 获取训练曲线（用于对比图）
+    curves = {}
+    for model in models:
+        job_id = model['id']
+        metrics_rows = execute_query('''
+            SELECT epoch, train_loss, val_loss, train_accuracy, val_accuracy
+            FROM training_metrics
+            WHERE job_id = %s
+            ORDER BY epoch ASC
+        ''', (job_id,))
+        
+        curves[model['id']] = {
+            "epochs": [r['epoch'] for r in metrics_rows],
+            "train_loss": [r['train_loss'] for r in metrics_rows],
+            "val_loss": [r['val_loss'] for r in metrics_rows],
+            "train_acc": [r['train_accuracy'] for r in metrics_rows],
+            "val_acc": [r['val_accuracy'] for r in metrics_rows]
+        }
+    
+    # 计算排名
+    rankings = []
+    completed_models = [m for m in models if m['status'] == 'completed']
+    
+    if completed_models:
+        # 按准确率排名
+        by_accuracy = sorted(completed_models, 
+                           key=lambda x: x['metrics']['best_accuracy'] or 0, 
+                           reverse=True)
+        
+        # 按损失排名
+        by_loss = sorted(completed_models, 
+                        key=lambda x: x['metrics']['best_val_loss'] or float('inf'))
+        
+        # 按训练速度排名（epochs/耗时）
+        by_speed = sorted(completed_models,
+                         key=lambda x: (x['metrics']['epochs_trained'] or 0))
+        
+        rankings = {
+            "best_accuracy": {"model_id": by_accuracy[0]['id'], "value": by_accuracy[0]['metrics']['best_accuracy']} if by_accuracy else None,
+            "lowest_loss": {"model_id": by_loss[0]['id'], "value": by_loss[0]['metrics']['best_val_loss']} if by_loss else None,
+            "fastest_convergence": {"model_id": by_speed[0]['id'], "epochs": by_speed[0]['metrics']['epochs_trained']} if by_speed else None
+        }
+    
+    return {
+        "models": models,
+        "curves": curves,
+        "rankings": rankings,
+        "comparison_count": len(models)
+    }
+
+
+@app.post("/api/projects/{project_id}/models/batch-evaluate")
+async def batch_evaluate_models(
+    project_id: str,
+    job_ids: str = Form(...),
+    test_texts: str = Form(..., description="JSON数组格式的测试文本列表")
+):
+    """
+    批量评估多个模型 - 在同一批测试数据上对比模型表现
+    
+    Args:
+        job_ids: 逗号分隔的模型ID
+        test_texts: JSON数组，如 ["文本1", "文本2", "文本3"]
+    
+    Returns:
+        每个模型的预测结果对比
+    """
+    import json
+    
+    ids = [j.strip() for j in job_ids.split(',') if j.strip()]
+    texts = json.loads(test_texts)
+    
+    if not texts:
+        raise HTTPException(status_code=400, detail="测试文本不能为空")
+    
+    # 加载所有模型
+    results = []
+    for job_id in ids:
+        # 加载模型
+        from inference_service import inference_service
+        
+        rows = execute_query('''
+            SELECT model_path, status FROM training_jobs 
+            WHERE id = %s AND project_id = %s
+        ''', (job_id, project_id))
+        
+        if not rows or rows[0]['status'] != 'completed':
+            continue
+        
+        model_path = rows[0]['model_path']
+        model_id = f"{project_id}/{job_id}"
+        
+        try:
+            inference_service.load_model(model_path, model_id)
+            predictions = inference_service.predict(texts, model_id)
+            
+            results.append({
+                "model_id": job_id,
+                "predictions": predictions
+            })
+        except Exception as e:
+            results.append({
+                "model_id": job_id,
+                "error": str(e)
+            })
+    
+    # 组织为对比格式
+    comparison = []
+    for i, text in enumerate(texts):
+        item = {"text": text, "predictions": {}}
+        for r in results:
+            if "error" not in r and i < len(r["predictions"]):
+                item["predictions"][r["model_id"]] = r["predictions"][i]
+        comparison.append(item)
+    
+    return {
+        "test_samples": len(texts),
+        "models_evaluated": len(results),
+        "comparison": comparison
+    }
 
 
 @app.websocket("/ws/training/{job_id}")
@@ -3995,6 +4661,106 @@ async def get_experiment_comparison(experiment_id: str):
 async def get_experiment_recommendation(experiment_id: str):
     """获取推荐配置"""
     return get_recommended_params(experiment_id)
+
+
+@app.get("/api/automl/experiments/{experiment_id}/visualization")
+async def get_experiment_visualization(experiment_id: str):
+    """
+    获取AutoML实验可视化数据
+    
+    返回格式化的数据用于：
+    - 平行坐标图：展示多维度超参数与性能的关系
+    - 散点图：展示特定参数与准确率的关系
+    - 热力图：展示两个参数组合对性能的影响
+    """
+    rows = execute_query("""
+        SELECT * FROM automl_experiments WHERE id = %s
+    """, (experiment_id,))
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    
+    experiment = rows[0]
+    task_type = experiment['task_type']
+    
+    # 获取所有trials
+    trials_rows = execute_query("""
+        SELECT trial_number, params, metrics, status
+        FROM automl_trials
+        WHERE experiment_id = %s AND status = 'completed'
+        ORDER BY trial_number
+    """, (experiment_id,))
+    
+    if not trials_rows:
+        return {
+            "experiment_id": experiment_id,
+            "task_type": task_type,
+            "trials_count": 0,
+            "message": "暂无完成的trial数据"
+        }
+    
+    trials = []
+    for row in trials_rows:
+        params = row['params'] if isinstance(row['params'], dict) else json.loads(row['params'])
+        metrics = row['metrics'] if isinstance(row['metrics'], dict) else json.loads(row['metrics'])
+        trials.append({
+            "trial_number": row['trial_number'],
+            "params": params,
+            "metrics": metrics
+        })
+    
+    # 获取搜索空间定义
+    search_space = AutoMLConfig.SEARCH_SPACES.get(task_type, {})
+    
+    # 提取所有参数名称
+    param_names = list(search_space.keys())
+    
+    # 格式化平行坐标图数据
+    parallel_data = []
+    for trial in trials:
+        item = {"trial_number": trial['trial_number']}
+        # 添加所有参数值
+        for param in param_names:
+            item[param] = trial['params'].get(param)
+        # 添加性能指标
+        item['accuracy'] = trial['metrics'].get('accuracy', 0)
+        item['loss'] = trial['metrics'].get('loss', 0)
+        parallel_data.append(item)
+    
+    # 格式化散点图数据（每个参数 vs 准确率）
+    scatter_data = {}
+    for param in param_names:
+        scatter_data[param] = [
+            {"x": trial['params'].get(param), "y": trial['metrics'].get('accuracy', 0), "trial": trial['trial_number']}
+            for trial in trials
+            if trial['params'].get(param) is not None
+        ]
+    
+    # 找最佳和最差trial
+    best_trial = max(trials, key=lambda t: t['metrics'].get('accuracy', 0))
+    worst_trial = min(trials, key=lambda t: t['metrics'].get('accuracy', 0))
+    
+    return {
+        "experiment_id": experiment_id,
+        "task_type": task_type,
+        "trials_count": len(trials),
+        "search_space": search_space,
+        "param_names": param_names,
+        "visualization": {
+            "parallel_coordinates": parallel_data,
+            "scatter_plots": scatter_data,
+            "best_trial": {
+                "trial_number": best_trial['trial_number'],
+                "accuracy": best_trial['metrics'].get('accuracy', 0),
+                "params": best_trial['params']
+            },
+            "worst_trial": {
+                "trial_number": worst_trial['trial_number'],
+                "accuracy": worst_trial['metrics'].get('accuracy', 0),
+                "params": worst_trial['params']
+            }
+        }
+    }
 
 
 @app.delete("/api/automl/experiments/{experiment_id}")

@@ -139,10 +139,17 @@ def send_feishu_notification(project_id: str, job_id: str, status: str, result: 
         logger.error(f"飞书通知发送失败: {e}")
 
 
-async def broadcast_training_update(job_id: str, data: Dict):
-    """广播训练更新到WebSocket"""
+def broadcast_training_update_sync(job_id: str, data: Dict):
+    """同步版本的WebSocket广播（用于Celery任务）"""
     if websocket_manager:
-        await websocket_manager.broadcast(job_id, data)
+        try:
+            # 创建新的事件循环来运行异步函数
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(websocket_manager.broadcast(job_id, data))
+            loop.close()
+        except Exception as e:
+            logger.debug(f"WebSocket广播失败（可能无客户端连接）: {e}")
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
@@ -238,6 +245,17 @@ def run_training_task(self, job_id: str, project_id: str, dataset_id: str, confi
                         'message': f'Epoch {epoch:.1f}, Loss: {loss:.4f}'
                     }
                 )
+                
+                # WebSocket实时推送
+                broadcast_training_update_sync(job_id, {
+                    "type": "training_update",
+                    "epoch": epoch,
+                    "progress": progress,
+                    "loss": loss,
+                    "val_loss": val_loss,
+                    "learning_rate": lr,
+                    "timestamp": datetime.now().isoformat()
+                })
             
             # 记录日志
             with open(log_path, "a") as f:
@@ -477,6 +495,7 @@ def run_image_training_task(self, job_id: str, project_id: str, dataset_id: str,
             epoch = logs.get('epoch', 0)
             total_epochs = config.get('epochs', 10)
             progress = min(int((epoch / total_epochs) * 100), 99)
+            val_acc = logs.get('val_acc')
             
             update_job_status(
                 job_id,
@@ -490,10 +509,20 @@ def run_image_training_task(self, job_id: str, project_id: str, dataset_id: str,
                 meta={
                     'progress': progress,
                     'epoch': epoch,
-                    'val_acc': logs.get('val_acc'),
-                    'message': f'Epoch {epoch}/{total_epochs}, Val Acc: {logs.get("val_acc", 0):.4f}'
+                    'val_acc': val_acc,
+                    'message': f'Epoch {epoch}/{total_epochs}, Val Acc: {val_acc or 0:.4f}'
                 }
             )
+            
+            # WebSocket实时推送
+            broadcast_training_update_sync(job_id, {
+                "type": "training_update",
+                "epoch": epoch,
+                "progress": progress,
+                "val_acc": val_acc,
+                "best_acc": logs.get('best_acc'),
+                "timestamp": datetime.now().isoformat()
+            })
         
         # 执行训练
         result = run_image_classification_training(
@@ -634,6 +663,15 @@ def run_object_detection_task(self, job_id: str, project_id: str, dataset_id: st
                     'message': f'Epoch {epoch}/{total_epochs}, mAP: {box_map:.4f}'
                 }
             )
+            
+            # WebSocket实时推送
+            broadcast_training_update_sync(job_id, {
+                "type": "training_update",
+                "epoch": epoch,
+                "progress": progress,
+                "box_map": box_map,
+                "timestamp": datetime.now().isoformat()
+            })
         
         # 执行训练
         result = run_object_detection_training(
